@@ -1,6 +1,5 @@
-# takes dans_pet_net.py and adds attention with a smaller embedding space,
-# for global attention and feartue space reduction for the fc layers. Just always
-# make sure the dummy input in _compute_fc_input_size is the shape of the real input data for proper initialisation.
+# takes attention_petnet.py and places the global attention layer after layer 3
+# for higher dimensional G.A.
 
 import torch
 import torch.nn as nn
@@ -14,7 +13,7 @@ class GlobalAttention3D(nn.Module):
     Uses manual attention implementation instead of nn.MultiheadAttention.
     """
     
-    def __init__(self, in_channels=512, embed_dim=128, output_dim=16, num_heads=2):
+    def __init__(self, in_channels=128, embed_dim=128, output_dim=16, num_heads=2):
         super(GlobalAttention3D, self).__init__()
         
         self.in_channels = in_channels
@@ -101,6 +100,10 @@ class GlobalAttention3D(nn.Module):
         
         # Project to output channels per token
         output = self.output_proj(attn_output)  # (batch, seq_len, output_dim)
+        
+        # Reshape back to 3D feature map format
+        # (batch, seq_len, output_dim) -> (batch, output_dim, D, H, W)
+        output = output.view(batch_size, D, H, W, -1).permute(0, 4, 1, 2, 3)
         
         return output
 
@@ -209,7 +212,7 @@ class PetNetImproved3D(nn.Module):
        i.e. 2 "channels" (inner, outer), T frames, 496 Height x 84 Width spatial.
        Width refers to the circumferencial axis. 
      - Uses 3D residual blocks.
-     - Ends with global attention.
+     - Global attention is applied after layer 3 (at 128 channels).
      - Output => 'num_classes' coordinates or labels.
     """
 
@@ -232,16 +235,21 @@ class PetNetImproved3D(nn.Module):
         self.layer1 = ResidualBlock3D(16, 32, stride=(1, 2, 2))  # downsample H,W
         self.layer2 = ResidualBlock3D(32, 64, stride=(1, 2, 2))  # downsample
         self.layer3 = ResidualBlock3D(64, 128, stride=(1, 2, 2))  # downsample
-        self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))  # downsample
-        self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))  # downsample
 
-        # Global attention - Remove the spatial_dims parameter
+        # Global attention after layer 3 (128 channels)
         self.global_attention = GlobalAttention3D(
-            in_channels=512, 
+            in_channels=128, 
             embed_dim=256, 
             output_dim=16, 
             num_heads=16
         )
+
+        # Continue with remaining layers after attention
+        self.layer4 = ResidualBlock3D(16, 256, stride=(1, 2, 2))  # downsample
+        self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))  # downsample
+
+        # Global average pooling to create fixed-size features
+        self.global_avg_pool = nn.AdaptiveAvgPool3d(1)
 
         self.dropout = nn.Dropout(0.3)
 
@@ -262,7 +270,7 @@ class PetNetImproved3D(nn.Module):
         but intermediate layers can reduce T if you used stride>1 in depth.
         """
         with torch.no_grad():
-            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
+            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=207, W=41)
             out = self.conv_in(dummy)
             out = self.bn_in(out)
             out = self.activation(out)
@@ -270,10 +278,16 @@ class PetNetImproved3D(nn.Module):
             out = self.layer1(out)
             out = self.layer2(out)
             out = self.layer3(out)
+            
+            # Apply global attention
+            out = self.global_attention(out)
+            
+            # Continue with remaining layers
             out = self.layer4(out)
             out = self.layer5(out)
-
-            out = self.global_attention(out)  # => shape (1, seq_len, output_dim)
+            
+            # Global average pooling
+            out = self.global_avg_pool(out)
             out = out.view(1, -1)
             return out.shape[1]
 
@@ -291,23 +305,29 @@ class PetNetImproved3D(nn.Module):
         x = self.activation(x)
         if debug: print(f"{x.shape} After activation")
 
-        # residual blocks
+        # residual blocks up to layer 3
         x = self.layer1(x)  # => (B,32,T, 496/2=248, 84/2=42), etc.
         if debug: print(f"{x.shape} After layer 1")
         x = self.layer2(x)
         if debug: print(f"{x.shape} After layer 2")
-        x = self.layer3(x)
+        x = self.layer3(x)  # => (B,128,T,H',W')
         if debug: print(f"{x.shape} After layer 3")
+
+        # global attention => (B, output_dim, D, H, W)
+        x = self.global_attention(x)
+        if debug: print(f"{x.shape} After global attention")
+
+        # continue with remaining layers
         x = self.layer4(x)
         if debug: print(f"{x.shape} After layer 4")
         x = self.layer5(x)
         if debug: print(f"{x.shape} After layer 5")
 
-        # global attention => (B, seq_len, output_dim)
-        x = self.global_attention(x)
-        if debug: print(f"{x.shape} After global attention")
+        # Global average pooling => (B, 512, 1, 1, 1)
+        x = self.global_avg_pool(x)
+        if debug: print(f"{x.shape} After global average pooling")
 
-        # flatten => (B, seq_len * output_dim)
+        # flatten => (B, 512)
         x = x.view(x.size(0), -1)
         if debug: print(f"{x.shape} After flattening")
 

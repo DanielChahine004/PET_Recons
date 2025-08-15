@@ -1,6 +1,5 @@
-# takes dans_pet_net.py and adds attention with a smaller embedding space,
-# for global attention and feartue space reduction for the fc layers. Just always
-# make sure the dummy input in _compute_fc_input_size is the shape of the real input data for proper initialisation.
+# takes attention_petnet.py and places the global attention layer after layer 2
+# for higher dimensional G.A.
 
 import torch
 import torch.nn as nn
@@ -14,13 +13,14 @@ class GlobalAttention3D(nn.Module):
     Uses manual attention implementation instead of nn.MultiheadAttention.
     """
     
-    def __init__(self, in_channels=512, embed_dim=128, output_dim=16, num_heads=2):
+    def __init__(self, in_channels=64, embed_dim=128, output_dim=64, num_heads=2):
         super(GlobalAttention3D, self).__init__()
         
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.output_dim = output_dim
         
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         
@@ -49,7 +49,7 @@ class GlobalAttention3D(nn.Module):
     def forward(self, x):
         """
         x: (batch_size, channels, D, H, W)
-        Returns: (batch_size, D*H*W*output_dim) -> flattened for FC layers
+        Returns: (batch_size, output_dim, D, H, W) -> reshaped back to conv format
         """
         batch_size, channels, D, H, W = x.shape
         seq_len = D * H * W
@@ -62,20 +62,20 @@ class GlobalAttention3D(nn.Module):
         
         # Reshape to treat spatial positions as sequence tokens
         # (batch_size, channels, D, H, W) -> (batch_size, D*H*W, channels)
-        x = x.permute(0, 2, 3, 4, 1).contiguous()  # (batch, D, H, W, channels)
-        x = x.view(batch_size, seq_len, channels)  # (batch, seq_len, channels)
+        x_flat = x.permute(0, 2, 3, 4, 1).contiguous()  # (batch, D, H, W, channels)
+        x_flat = x_flat.view(batch_size, seq_len, channels)  # (batch, seq_len, channels)
         
         # Project to embedding dimension
-        x = self.channel_proj(x)  # (batch, seq_len, embed_dim)
+        x_flat = self.channel_proj(x_flat)  # (batch, seq_len, embed_dim)
         
         # Add positional encoding
-        x = x + self.pos_encoding  # (batch, seq_len, embed_dim)
+        x_flat = x_flat + self.pos_encoding  # (batch, seq_len, embed_dim)
         
         # Manual multi-head attention
         # Project to Q, K, V
-        q = self.q_proj(x)  # (batch, seq_len, embed_dim)
-        k = self.k_proj(x)  # (batch, seq_len, embed_dim)
-        v = self.v_proj(x)  # (batch, seq_len, embed_dim)
+        q = self.q_proj(x_flat)  # (batch, seq_len, embed_dim)
+        k = self.k_proj(x_flat)  # (batch, seq_len, embed_dim)
+        v = self.v_proj(x_flat)  # (batch, seq_len, embed_dim)
         
         # Reshape for multi-head attention
         # (batch, seq_len, embed_dim) -> (batch, seq_len, num_heads, head_dim) -> (batch, num_heads, seq_len, head_dim)
@@ -101,6 +101,10 @@ class GlobalAttention3D(nn.Module):
         
         # Project to output channels per token
         output = self.output_proj(attn_output)  # (batch, seq_len, output_dim)
+        
+        # Reshape back to conv format: (batch, seq_len, output_dim) -> (batch, output_dim, D, H, W)
+        output = output.permute(0, 2, 1)  # (batch, output_dim, seq_len)
+        output = output.view(batch_size, self.output_dim, D, H, W)  # (batch, output_dim, D, H, W)
         
         return output
 
@@ -200,7 +204,7 @@ class ResidualBlock3D(nn.Module):
 
 
 ###############################################################################
-# PetNetImproved3D
+# PetNetImproved3D with Early Global Attention
 ###############################################################################
 class PetNetImproved3D(nn.Module):
     """
@@ -209,12 +213,12 @@ class PetNetImproved3D(nn.Module):
        i.e. 2 "channels" (inner, outer), T frames, 496 Height x 84 Width spatial.
        Width refers to the circumferencial axis. 
      - Uses 3D residual blocks.
-     - Ends with global attention.
+     - Global attention applied after layer2 (at higher dimensionality).
      - Output => 'num_classes' coordinates or labels.
     """
 
     def __init__(self, num_classes=6):
-        print("Loading PetnetImproved3D Model...")
+        print("Loading PetnetImproved3D Model with Early Global Attention...")
         super(PetNetImproved3D, self).__init__()
 
         # Initial 3D conv: 2 => 16 channels
@@ -226,22 +230,22 @@ class PetNetImproved3D(nn.Module):
         self.bn_in = nn.BatchNorm3d(16)
         self.activation = nn.GELU()
 
-        # Residual blocks
-        # We apply stride=(1,2,2) to reduce only in the spatial dims (H,W)
-        # If you'd like to also reduce T, set strideD>1.
+        # First two residual blocks
         self.layer1 = ResidualBlock3D(16, 32, stride=(1, 2, 2))  # downsample H,W
         self.layer2 = ResidualBlock3D(32, 64, stride=(1, 2, 2))  # downsample
+
+        # Global attention after layer2 (64 channels, higher spatial resolution)
+        self.global_attention = GlobalAttention3D(
+            in_channels=64, 
+            embed_dim=128, 
+            output_dim=64, 
+            num_heads=8
+        )
+
+        # Remaining residual blocks (continuing from 64 channels)
         self.layer3 = ResidualBlock3D(64, 128, stride=(1, 2, 2))  # downsample
         self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))  # downsample
         self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))  # downsample
-
-        # Global attention - Remove the spatial_dims parameter
-        self.global_attention = GlobalAttention3D(
-            in_channels=512, 
-            embed_dim=256, 
-            output_dim=16, 
-            num_heads=16
-        )
 
         self.dropout = nn.Dropout(0.3)
 
@@ -262,19 +266,23 @@ class PetNetImproved3D(nn.Module):
         but intermediate layers can reduce T if you used stride>1 in depth.
         """
         with torch.no_grad():
-            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
+            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=207, W=41)
             out = self.conv_in(dummy)
             out = self.bn_in(out)
             out = self.activation(out)
 
             out = self.layer1(out)
             out = self.layer2(out)
+            
+            # Apply attention after layer2
+            out = self.global_attention(out)
+            
             out = self.layer3(out)
             out = self.layer4(out)
             out = self.layer5(out)
 
-            out = self.global_attention(out)  # => shape (1, seq_len, output_dim)
-            out = out.view(1, -1)
+            # Global average pooling to flatten
+            out = torch.mean(out, dim=(2, 3, 4))  # Global average pool over D,H,W
             return out.shape[1]
 
     def forward(self, x, debug=False):
@@ -291,11 +299,17 @@ class PetNetImproved3D(nn.Module):
         x = self.activation(x)
         if debug: print(f"{x.shape} After activation")
 
-        # residual blocks
+        # first two residual blocks
         x = self.layer1(x)  # => (B,32,T, 496/2=248, 84/2=42), etc.
         if debug: print(f"{x.shape} After layer 1")
         x = self.layer2(x)
         if debug: print(f"{x.shape} After layer 2")
+
+        # global attention after layer2 (at higher dimensionality)
+        x = self.global_attention(x)  # => (B, 64, D, H, W)
+        if debug: print(f"{x.shape} After global attention")
+
+        # remaining residual blocks
         x = self.layer3(x)
         if debug: print(f"{x.shape} After layer 3")
         x = self.layer4(x)
@@ -303,13 +317,9 @@ class PetNetImproved3D(nn.Module):
         x = self.layer5(x)
         if debug: print(f"{x.shape} After layer 5")
 
-        # global attention => (B, seq_len, output_dim)
-        x = self.global_attention(x)
-        if debug: print(f"{x.shape} After global attention")
-
-        # flatten => (B, seq_len * output_dim)
-        x = x.view(x.size(0), -1)
-        if debug: print(f"{x.shape} After flattening")
+        # Global average pooling to flatten => (B, 512)
+        x = torch.mean(x, dim=(2, 3, 4))  # Global average pool over D,H,W
+        if debug: print(f"{x.shape} After global average pooling")
 
         # FC layers
         x = self.fc1(x)
