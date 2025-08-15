@@ -1,4 +1,4 @@
-# takes danspetnet.py and adds attention with a smaller embedding space,
+# takes dans_pet_net.py and adds attention with a smaller embedding space,
 # for global attention and feartue space reduction for the fc layers. Just always
 # make sure the dummy input in _compute_fc_input_size is the shape of the real input data for proper initialisation.
 
@@ -6,15 +6,12 @@ import torch
 import torch.nn as nn
 
 ###############################################################################
-# Global Attention Module for 3D Feature Maps
-# This module maps channels to an embedding space, applies self-attention across
-# spatial positions, and then maps back to a lower dimension for each D,H,W token.
+# Global Attention Module
 ###############################################################################
 class GlobalAttention3D(nn.Module):
     """
-    Global attention module for 3D feature maps.
-    Maps channels to embedding space, applies self-attention across spatial positions,
-    then maps back to a smaller feature dimension per token.
+    TorchScript-compatible global attention module for 3D feature maps.
+    Uses manual attention implementation instead of nn.MultiheadAttention.
     """
     
     def __init__(self, in_channels=512, embed_dim=128, output_dim=16, num_heads=2):
@@ -23,22 +20,25 @@ class GlobalAttention3D(nn.Module):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         
         # Map from input channels to embedding dimension
         self.channel_proj = nn.Linear(in_channels, embed_dim)
         
-        # Multi-head self-attention
-        self.multihead_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
+        # Manual attention projections (instead of nn.MultiheadAttention)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
         
-        # Map from embedding dimension to output channels (shared across all tokens)
+        # Map from embedding dimension to output channels
         self.output_proj = nn.Linear(embed_dim, output_dim)
         
         # Learnable positional encoding will be initialized based on input size
         self.pos_encoding = None
+        self.scale = self.head_dim ** -0.5
         
     def _init_positional_encoding(self, D, H, W):
         """Initialize learnable positional encoding for DxHxW spatial positions"""
@@ -49,9 +49,10 @@ class GlobalAttention3D(nn.Module):
     def forward(self, x):
         """
         x: (batch_size, channels, D, H, W)
-        Returns: (batch_size, D*H*W*16)
+        Returns: (batch_size, D*H*W*output_dim) -> flattened for FC layers
         """
         batch_size, channels, D, H, W = x.shape
+        seq_len = D * H * W
         
         # Initialize positional encoding on first forward pass
         if self.pos_encoding is None:
@@ -62,21 +63,47 @@ class GlobalAttention3D(nn.Module):
         # Reshape to treat spatial positions as sequence tokens
         # (batch_size, channels, D, H, W) -> (batch_size, D*H*W, channels)
         x = x.permute(0, 2, 3, 4, 1).contiguous()  # (batch, D, H, W, channels)
-        x = x.view(batch_size, D * H * W, channels)  # (batch, D*H*W, channels)
+        x = x.view(batch_size, seq_len, channels)  # (batch, seq_len, channels)
         
         # Project to embedding dimension
-        x = self.channel_proj(x)  # (batch, D*H*W, embed_dim)
+        x = self.channel_proj(x)  # (batch, seq_len, embed_dim)
         
         # Add positional encoding
-        x = x + self.pos_encoding  # (batch, D*H*W, embed_dim)
+        x = x + self.pos_encoding  # (batch, seq_len, embed_dim)
         
-        # Apply self-attention
-        attn_output, _ = self.multihead_attn(x, x, x)  # (batch, D*H*W, embed_dim)
+        # Manual multi-head attention
+        # Project to Q, K, V
+        q = self.q_proj(x)  # (batch, seq_len, embed_dim)
+        k = self.k_proj(x)  # (batch, seq_len, embed_dim)
+        v = self.v_proj(x)  # (batch, seq_len, embed_dim)
+        
+        # Reshape for multi-head attention
+        # (batch, seq_len, embed_dim) -> (batch, seq_len, num_heads, head_dim) -> (batch, num_heads, seq_len, head_dim)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        # (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len) -> (batch, num_heads, seq_len, seq_len)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        
+        # Apply attention to values
+        # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim) -> (batch, num_heads, seq_len, head_dim)
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Concatenate heads
+        # (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, num_heads, head_dim) -> (batch, seq_len, embed_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        
+        # Output projection
+        attn_output = self.out_proj(attn_output)  # (batch, seq_len, embed_dim)
         
         # Project to output channels per token
-        output = self.output_proj(attn_output)  # (batch, D*H*W, output_dim)
+        output = self.output_proj(attn_output)  # (batch, seq_len, output_dim)
         
         return output
+
 
 ###############################################################################
 # 3D Residual Block
@@ -145,7 +172,6 @@ class ResidualBlock3D(nn.Module):
 
         return x
 
-
     def forward(self, x):
         # Main path
         out = self._apply_circular_padding(x)
@@ -176,7 +202,6 @@ class ResidualBlock3D(nn.Module):
 ###############################################################################
 # PetNetImproved3D
 ###############################################################################
-
 class PetNetImproved3D(nn.Module):
     """
     A 3D version of PetNet:
@@ -184,7 +209,7 @@ class PetNetImproved3D(nn.Module):
        i.e. 2 "channels" (inner, outer), T frames, 496 Height x 84 Width spatial.
        Width refers to the circumferencial axis. 
      - Uses 3D residual blocks.
-     - Ends with global average pooling over (D,H,W).
+     - Ends with global attention.
      - Output => 'num_classes' coordinates or labels.
     """
 
@@ -210,21 +235,24 @@ class PetNetImproved3D(nn.Module):
         self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))  # downsample
         self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))  # downsample
 
-        # Global attention
-        self.global_attention = GlobalAttention3D(in_channels=512, embed_dim=128, output_dim=16, num_heads=2)
+        # Global attention - Remove the spatial_dims parameter
+        self.global_attention = GlobalAttention3D(
+            in_channels=512, 
+            embed_dim=256, 
+            output_dim=16, 
+            num_heads=16
+        )
 
-        # We'll compute fc_in_features dynamically
-        self.fc1 = None
-        self.fc2 = None
         self.dropout = nn.Dropout(0.3)
 
+        # We'll compute fc_in_features dynamically
         fc_in_features = self._compute_fc_input_size()
         self.fc1 = nn.Linear(fc_in_features, 1024, bias=True)
         self.fc2 = nn.Linear(1024, num_classes, bias=True)
 
         self._initialize_weights()
 
-    def _compute_fc_input_size(self, T=3, H=207, W=41):
+    def _compute_fc_input_size(self, C=2, T=3, H=207, W=41):
         """
         Runs a dummy forward pass with shape (1, 2, T, H, W)
         to determine final flattened size going into the FC layer.
@@ -234,7 +262,7 @@ class PetNetImproved3D(nn.Module):
         but intermediate layers can reduce T if you used stride>1 in depth.
         """
         with torch.no_grad():
-            dummy = torch.zeros(1, 2, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
+            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
             out = self.conv_in(dummy)
             out = self.bn_in(out)
             out = self.activation(out)
@@ -245,7 +273,7 @@ class PetNetImproved3D(nn.Module):
             out = self.layer4(out)
             out = self.layer5(out)
 
-            out = self.global_attention(out)  # => shape (1, output_dim, D, H, W)
+            out = self.global_attention(out)  # => shape (1, seq_len, output_dim)
             out = out.view(1, -1)
             return out.shape[1]
 
@@ -275,11 +303,11 @@ class PetNetImproved3D(nn.Module):
         x = self.layer5(x)
         if debug: print(f"{x.shape} After layer 5")
 
-        # global pool => (B, 512, 1,1,1)
+        # global attention => (B, seq_len, output_dim)
         x = self.global_attention(x)
         if debug: print(f"{x.shape} After global attention")
 
-        # flatten => (B, H*W*D*output_dim)
+        # flatten => (B, seq_len * output_dim)
         x = x.view(x.size(0), -1)
         if debug: print(f"{x.shape} After flattening")
 
@@ -313,8 +341,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    B = 8
+    # B = 128
 
-    B = 128
     C = 2
     T = 3 
 
@@ -325,7 +354,6 @@ if __name__ == "__main__":
     # W = 84
     
     CLASSES = 6
-
 
     # Model instantiation
     model = PetNetImproved3D(num_classes=CLASSES).to(device)
