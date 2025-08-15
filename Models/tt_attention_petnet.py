@@ -1,14 +1,37 @@
-# takes danspetnet.py and adds attention with a smaller embedding space,
-# for global attention and feartue space reduction for the fc layers. Just always
-# make sure the dummy input in _compute_fc_input_size is the shape of the real input data for proper initialisation.
-
 import torch
 import torch.nn as nn
 
 ###############################################################################
-# Global Attention Module for 3D Feature Maps
-# This module maps channels to an embedding space, applies self-attention across
-# spatial positions, and then maps back to a lower dimension for each D,H,W token.
+# Global Attention Module
+###############################################################################
+class TTLinear(nn.Module):
+    """
+    Tensor Train Modules in place of Linear layers
+    Represents higher dimension tensors as the product of smaller core tensors,
+    reducing parameters and memory, while approximating the larger matrix.     
+    """
+    
+    def __init__(self, input_dim: int, output_dim: int, tt_rank: int = 16):
+        super().__init__()
+        
+        # Factorize the weight matrix W = U @ V where U and V have rank tt_rank
+        self.U = nn.Parameter(torch.randn(output_dim, tt_rank) * 0.1)
+        self.V = nn.Parameter(torch.randn(tt_rank, input_dim) * 0.1)
+        
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.tt_rank = tt_rank
+    
+    def forward(self, x):
+        # W = U @ V, so W @ x = U @ (V @ x)
+        return torch.matmul(x, self.V.T) @ self.U.T
+    
+    def get_param_count(self):
+        return self.output_dim * self.tt_rank + self.tt_rank * self.input_dim
+    
+    
+###############################################################################
+# Global Attention Module
 ###############################################################################
 class GlobalAttention3D(nn.Module):
     """
@@ -17,15 +40,27 @@ class GlobalAttention3D(nn.Module):
     then maps back to a smaller feature dimension per token.
     """
     
-    def __init__(self, in_channels=512, embed_dim=128, output_dim=16, num_heads=2):
+    def __init__(self, in_channels=512, embed_dim=128, output_dim=16, num_heads=2, 
+                 spatial_dims=None, tt_rank=16):
         super(GlobalAttention3D, self).__init__()
         
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         
-        # Map from input channels to embedding dimension
-        self.channel_proj = nn.Linear(in_channels, embed_dim)
+        # Calculate expected spatial dimensions after conv layers
+        # Based on your architecture: T=3, H=207, W=41 -> after 5 blocks with stride=(1,2,2)
+        # Each block reduces H,W by factor of 2 (5 times) and has 3 conv3d with padding
+        # Approximate final spatial dims: T=3, H≈13, W≈3 (accounting for padding reductions)
+        if spatial_dims is None:
+            # Default based on your dummy input calculation
+            spatial_dims = (3, 13, 3)  # (D, H, W)
+        
+        D, H, W = spatial_dims
+        num_positions = D * H * W
+        
+        # Map from input channels to embedding dimension - REPLACED WITH TTLinear
+        self.channel_proj = TTLinear(in_channels, embed_dim, tt_rank=tt_rank)
         
         # Multi-head self-attention
         self.multihead_attn = nn.MultiheadAttention(
@@ -34,35 +69,28 @@ class GlobalAttention3D(nn.Module):
             batch_first=True
         )
         
-        # Map from embedding dimension to output channels (shared across all tokens)
-        self.output_proj = nn.Linear(embed_dim, output_dim)
+        # Map from embedding dimension to output channels - REPLACED WITH TTLinear
+        self.output_proj = TTLinear(embed_dim, output_dim, tt_rank=tt_rank)
         
-        # Learnable positional encoding will be initialized based on input size
-        self.pos_encoding = None
-        
-    def _init_positional_encoding(self, D, H, W):
-        """Initialize learnable positional encoding for DxHxW spatial positions"""
-        num_positions = D * H * W
-        self.pos_encoding = nn.Parameter(torch.randn(1, num_positions, self.embed_dim))
+        # Fixed positional encoding
+        self.pos_encoding = nn.Parameter(torch.randn(1, num_positions, embed_dim))
         nn.init.normal_(self.pos_encoding, std=0.02)
         
     def forward(self, x):
         """
         x: (batch_size, channels, D, H, W)
-        Returns: (batch_size, D*H*W*16)
+        Returns: (batch_size, D*H*W*output_dim)
         """
         batch_size, channels, D, H, W = x.shape
-        
-        # Initialize positional encoding on first forward pass
-        if self.pos_encoding is None:
-            self._init_positional_encoding(D, H, W)
-            # Move to same device as input
-            self.pos_encoding = self.pos_encoding.to(x.device)
         
         # Reshape to treat spatial positions as sequence tokens
         # (batch_size, channels, D, H, W) -> (batch_size, D*H*W, channels)
         x = x.permute(0, 2, 3, 4, 1).contiguous()  # (batch, D, H, W, channels)
         x = x.view(batch_size, D * H * W, channels)  # (batch, D*H*W, channels)
+        
+        # Verify dimensions match expectations
+        assert x.size(1) == self.pos_encoding.size(1), \
+            f"Spatial dimension mismatch: expected {self.pos_encoding.size(1)}, got {x.size(1)}"
         
         # Project to embedding dimension
         x = self.channel_proj(x)  # (batch, D*H*W, embed_dim)
@@ -77,6 +105,7 @@ class GlobalAttention3D(nn.Module):
         output = self.output_proj(attn_output)  # (batch, D*H*W, output_dim)
         
         return output
+    
 
 ###############################################################################
 # 3D Residual Block
@@ -145,7 +174,6 @@ class ResidualBlock3D(nn.Module):
 
         return x
 
-
     def forward(self, x):
         # Main path
         out = self._apply_circular_padding(x)
@@ -188,9 +216,11 @@ class PetNetImproved3D(nn.Module):
      - Output => 'num_classes' coordinates or labels.
     """
 
-    def __init__(self, num_classes=6):
-        print("Loading PetnetImproved3D Model...")
+    def __init__(self, num_classes=6, tt_rank=16):
+        print("Loading PetnetImproved3D Model with TTLinear layers...")
         super(PetNetImproved3D, self).__init__()
+
+        self.tt_rank = tt_rank
 
         # Initial 3D conv: 2 => 16 channels
         # kernel_size=3 => (3,3,3)
@@ -210,21 +240,49 @@ class PetNetImproved3D(nn.Module):
         self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))  # downsample
         self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))  # downsample
 
-        # Global attention
-        self.global_attention = GlobalAttention3D(in_channels=512, embed_dim=128, output_dim=16, num_heads=2)
 
-        # We'll compute fc_in_features dynamically
-        self.fc1 = None
-        self.fc2 = None
+        ga_input = self._compute_ga_input_size()
+        # Global attention with TTLinear
+        self.global_attention = GlobalAttention3D(
+            in_channels=512, 
+            embed_dim=128, 
+            output_dim=16, 
+            num_heads=2,
+            spatial_dims=(ga_input[-3], ga_input[-2], ga_input[-1]),  # Adjust based on your actual final spatial dims
+            tt_rank=tt_rank
+        )
+
         self.dropout = nn.Dropout(0.3)
 
+        # We'll compute fc_in_features dynamically
         fc_in_features = self._compute_fc_input_size()
-        self.fc1 = nn.Linear(fc_in_features, 1024, bias=True)
-        self.fc2 = nn.Linear(1024, num_classes, bias=True)
+        # REPLACED WITH TTLinear
+        self.fc1 = TTLinear(fc_in_features, 1024, tt_rank=tt_rank)
+        self.fc2 = TTLinear(1024, num_classes, tt_rank=tt_rank)
 
         self._initialize_weights()
 
-    def _compute_fc_input_size(self, T=3, H=207, W=41):
+    def _compute_ga_input_size(self, C=2, T=3, H=207, W=41):
+        """
+        Runs a dummy forward pass with shape (1, C, T, H, W)
+        to initialise the GlobalAttention3D. 
+
+        """
+        with torch.no_grad():
+            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
+            out = self.conv_in(dummy)
+            out = self.bn_in(out)
+            out = self.activation(out)
+
+            out = self.layer1(out)
+            out = self.layer2(out)
+            out = self.layer3(out)
+            out = self.layer4(out)
+            out = self.layer5(out)
+
+            return out.shape
+
+    def _compute_fc_input_size(self, C=2, T=3, H=207, W=41):
         """
         Runs a dummy forward pass with shape (1, 2, T, H, W)
         to determine final flattened size going into the FC layer.
@@ -234,7 +292,7 @@ class PetNetImproved3D(nn.Module):
         but intermediate layers can reduce T if you used stride>1 in depth.
         """
         with torch.no_grad():
-            dummy = torch.zeros(1, 2, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
+            dummy = torch.zeros(1, C, T, H, W)  # (N=1, C=2, D=T, H=496, W=84)
             out = self.conv_in(dummy)
             out = self.bn_in(out)
             out = self.activation(out)
@@ -296,17 +354,37 @@ class PetNetImproved3D(nn.Module):
 
     def _initialize_weights(self):
         """
-        Kaiming (He) Initialization for Conv3d and Linear layers.
+        Kaiming (He) Initialization for Conv3d and TTLinear layers.
         """
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, TTLinear):
+                # Initialize TTLinear weights with Kaiming normal
+                nn.init.kaiming_normal_(m.U, nonlinearity='relu')
+                nn.init.kaiming_normal_(m.V, nonlinearity='relu')
+
+    def get_parameter_summary(self):
+        """
+        Returns a summary of parameter counts for TTLinear vs standard Linear layers.
+        """
+        tt_params = 0
+        standard_params = 0
+        
+        for name, module in self.named_modules():
+            if isinstance(module, TTLinear):
+                tt_params += module.get_param_count()
+                # Calculate what the standard linear layer would have been
+                standard_params += module.input_dim * module.output_dim
+        
+        return {
+            'tt_linear_params': tt_params,
+            'equivalent_standard_params': standard_params,
+            'compression_ratio': standard_params / tt_params if tt_params > 0 else 0
+        }
+
 
 if __name__ == "__main__":
 
@@ -327,12 +405,18 @@ if __name__ == "__main__":
     CLASSES = 6
 
 
-    # Model instantiation
-    model = PetNetImproved3D(num_classes=CLASSES).to(device)
+    # Model instantiation with TTLinear
+    model = PetNetImproved3D(num_classes=CLASSES, tt_rank=16).to(device)
     
     # Print parameter count
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {param_count:,}")
+    
+    # Print TTLinear compression summary
+    param_summary = model.get_parameter_summary()
+    print(f"TTLinear parameters: {param_summary['tt_linear_params']:,}")
+    print(f"Equivalent standard Linear parameters: {param_summary['equivalent_standard_params']:,}")
+    print(f"Compression ratio: {param_summary['compression_ratio']:.2f}x")
     
     dummy_input = torch.randn(B, C, T, H, W).to(device)
     dummy_target = torch.randn(B, CLASSES).to(device)
