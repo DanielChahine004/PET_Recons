@@ -480,7 +480,7 @@ if __name__ == "__main__":
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {param_count:,}")
 
-    # Dummy training loop to observe loss reduction - EXACTLY AS YOURS
+    # Dummy training loop to observe loss reduction
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     criterion = nn.MSELoss()
 
