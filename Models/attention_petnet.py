@@ -341,8 +341,8 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    B = 8
-    # B = 128
+    # B = 8
+    B = 128
 
     C = 2
     T = 3 

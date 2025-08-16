@@ -49,7 +49,7 @@ class GlobalAttention3D(nn.Module):
         # Learnable gate for skip connection strength
         self.gate = nn.Parameter(torch.tensor(0.1))
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         x: (batch_size, channels, D, H, W)
         Returns: (batch_size, output_dim, D, H, W)
@@ -57,18 +57,23 @@ class GlobalAttention3D(nn.Module):
         batch_size, channels, D, H, W = x.shape
         seq_len = D * H * W
         
+        if debug: print(f"GlobalAttention input: {x.shape}")
+        
         # Store input for skip connection
         skip_input = x
         
         # Reshape to treat spatial positions as sequence tokens
         x_flat = x.permute(0, 2, 3, 4, 1).contiguous()
         x_flat = x_flat.view(batch_size, seq_len, channels)
+        if debug: print(f"After reshaping to sequence: {x_flat.shape}")
         
         # Project to embedding dimension
         x_flat = self.channel_proj(x_flat)
+        if debug: print(f"After channel projection: {x_flat.shape}")
         
         # Add positional encoding (slice to current sequence length)
         x_flat = x_flat + self.pos_encoding[:, :seq_len, :]
+        if debug: print(f"After positional encoding: {x_flat.shape}")
         
         # Manual multi-head attention
         q = self.q_proj(x_flat)
@@ -80,6 +85,8 @@ class GlobalAttention3D(nn.Module):
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
+        if debug: print(f"Q, K, V shapes after head reshaping: {q.shape}, {k.shape}, {v.shape}")
+        
         # Scaled dot-product attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn_weights = torch.softmax(attn_weights, dim=-1)
@@ -89,16 +96,19 @@ class GlobalAttention3D(nn.Module):
         
         # Concatenate heads
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        if debug: print(f"After concatenating heads: {attn_output.shape}")
         
         # Output projection
         attn_output = self.out_proj(attn_output)
         
         # Project to output channels per token
         output = self.output_proj(attn_output)
+        if debug: print(f"After output projection: {output.shape}")
         
         # Reshape back to conv format
         output = output.permute(0, 2, 1)
         output = output.view(batch_size, self.output_dim, D, H, W)
+        if debug: print(f"After reshaping back to 3D: {output.shape}")
         
         # Skip connection (always apply projection, but conditionally use it)
         projected_skip = self.skip_bn(self.skip_proj(skip_input))
@@ -107,6 +117,7 @@ class GlobalAttention3D(nn.Module):
         
         # Add skip connection with learnable gate
         output = output + self.gate * skip_input
+        if debug: print(f"After skip connection: {output.shape}")
         
         return output
 
@@ -144,11 +155,13 @@ class NormalizedDirectTensorTrain3D(nn.Module):
         
         self.output_size = rank * 3
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         Apply normalization then tensor train decomposition.
         """
         batch_size, channels, D, H, W = x.shape
+        
+        if debug: print(f"TensorTrain input: {x.shape}")
         
         # Apply normalization based on norm_type (TorchScript compatible)
         if self.norm_type == 0:  # 'batch'
@@ -162,8 +175,11 @@ class NormalizedDirectTensorTrain3D(nn.Module):
         else:  # 'none'
             x_norm = self.identity(x)
         
+        if debug: print(f"After normalization: {x_norm.shape}")
+        
         # Reshape for processing
         x_flat = x_norm.reshape(batch_size * channels, D, H, W)
+        if debug: print(f"Flattened for TT processing: {x_flat.shape}")
         
         # Mode-wise contractions with improved numerical stability
         # Mode-1: contract over D dimension
@@ -180,12 +196,14 @@ class NormalizedDirectTensorTrain3D(nn.Module):
         
         # Concatenate mode summaries
         core_summaries = torch.cat([mode1_summary, mode2_summary, mode3_summary], dim=1)
+        if debug: print(f"Concatenated core summaries: {core_summaries.shape}")
         
         # Apply activation function for stabilization and non-linearity
         core_summaries = self.activation(core_summaries)
         
         # Reshape back to batch format
         output = core_summaries.reshape(batch_size, channels * self.output_size)
+        if debug: print(f"TensorTrain output: {output.shape}")
         
         return output
 
@@ -244,30 +262,38 @@ class ResidualBlock3D(nn.Module):
         x = torch.nn.functional.pad(x, (0, 0, 1, 1, 1, 1), mode='constant', value=0.0)
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
+        if debug: print(f"ResBlock input: {x.shape}")
+        
         # Main path
         out = self._apply_circular_padding(x)
+        if debug: print(f"After padding: {out.shape}")
         out = self.conv1(out)
         out = self.bn1(out)
         out = self.activation(out)
+        if debug: print(f"After conv1+bn1+activation: {out.shape}")
 
         out = self._apply_circular_padding(out)
         out = self.conv2(out)
         out = self.bn2(out)
+        if debug: print(f"After conv2+bn2: {out.shape}")
 
         # Shortcut (always compute, conditionally use)
         shortcut_out = self.shortcut_bn(self.shortcut_conv(x))
         if self.use_shortcut:
             x = shortcut_out
+        if debug: print(f"Shortcut: {x.shape}")
 
         # Residual connection
         out += x
+        if debug: print(f"After residual connection: {out.shape}")
 
         # Post skip-connection processing
         out = self._apply_circular_padding(out)
         out = self.conv_post(out)
         out = self.bn_post(out)
         out = self.activation(out)
+        if debug: print(f"After post-processing: {out.shape}")
         
         return out
 
@@ -283,6 +309,7 @@ class PetNetImproved3D(nn.Module):
     def __init__(self, num_classes: int = 6, tt_rank: int = 32, norm_type: int = 0, 
                  input_shape: Tuple[int, int, int, int] = (2, 3, 207, 41)):
         super(PetNetImproved3D, self).__init__()
+        print("Loading PetNetImproved3D Model...")
 
         self.tt_rank = tt_rank
         self.norm_type = norm_type
@@ -373,31 +400,42 @@ class PetNetImproved3D(nn.Module):
         x: expected shape (batch_size, 2, T, H, W)
         """
         # Initial conv
+        if debug: print(f"Input shape: {x.shape}")
         x = self.conv_in(x)
         x = self.bn_in(x)
         x = self.activation(x)
+        if debug: print(f"After conv_in: {x.shape}")
 
         # Residual blocks
-        x = self.layer1(x)
-        x = self.layer2(x)
+        x = self.layer1(x, debug=debug)
+        if debug: print(f"After layer1: {x.shape}")
+        x = self.layer2(x, debug=debug)
+        if debug: print(f"After layer2: {x.shape}")
 
         # Global attention with skip connection
-        x = self.global_attention(x)
+        x = self.global_attention(x, debug=debug)
+        if debug: print(f"After global attention: {x.shape}")
         
-        x = self.layer3(x)
-        x = self.layer4(x)
+        x = self.layer3(x, debug=debug)
+        if debug: print(f"After layer3: {x.shape}")
+        x = self.layer4(x, debug=debug)
+        if debug: print(f"After layer4: {x.shape}")
         
         # Ensure tensor is contiguous before tensor train
         x = x.contiguous()
 
         # Apply normalized tensor train decomposition
-        x = self.tensor_train(x)
+        x = self.tensor_train(x, debug=debug)
+        if debug: print(f"After tensor train: {x.shape}")
 
         # FC layers
         x = self.fc1(x)
+        if debug: print(f"After fc1: {x.shape}")
         x = self.activation(x)
         x = self.dropout(x)
+        if debug: print(f"After activation and dropout: {x.shape}")
         x = self.fc2(x)
+        if debug: print(f"After fc2 (output): {x.shape}")
 
         return x
 
@@ -425,10 +463,17 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     B = 8
+    # B = 128
+
     C = 2
     T = 3 
+
     H = 207
+    # H = 496
+
     W = 41
+    # W = 84
+    
     CLASSES = 6
 
     # Model instantiation with TorchScript-compatible static initialization
@@ -447,13 +492,19 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ TorchScript error: {e}")
     
-    # Test a dummy pass
+    # Test a dummy pass with debug output
     dummy_input = torch.randn(B, C, T, H, W).to(device)
     dummy_target = torch.randn(B, CLASSES).to(device)
     
+    print("\n" + "="*60)
+    print("DEBUGGING FORWARD PASS")
+    print("="*60)
+    
     # Test both regular and scripted model
-    output_regular = model(dummy_input)
+    output_regular = model(dummy_input, debug=True)
     if 'scripted_model' in locals():
+        print("\n" + "-"*40)
+        print("Testing scripted model...")
         output_scripted = scripted_model(dummy_input)
         print(f"Regular model output shape: {output_regular.shape}")
         print(f"Scripted model output shape: {output_scripted.shape}")
@@ -461,7 +512,11 @@ if __name__ == "__main__":
     
     # Print parameter count
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {param_count:,}")
+    print(f"\nTotal parameters: {param_count:,}")
+
+    print("\n" + "="*60)
+    print("STARTING TRAINING LOOP")
+    print("="*60)
 
     # Training loop
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
@@ -484,4 +539,4 @@ if __name__ == "__main__":
         print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, Forward Time: {forward_time:.6f}s")
 
     average_time = total_time / epochs
-    print(f"Average Forward Pass Time: {average_time:.6f}s")
+    print(f"\nAverage Forward Pass Time: {average_time:.6f}s")
