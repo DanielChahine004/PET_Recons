@@ -156,8 +156,8 @@ class NormalizedDirectTensorTrain3D(nn.Module):
         self.core2 = nn.Parameter(torch.randn(rank, self.H, rank) * (2.0 / (self.H + 2*rank)) ** 0.5)
         self.core3 = nn.Parameter(torch.randn(rank, self.W, 1) * (2.0 / (self.W + rank)) ** 0.5)
         
-        # Optional: Add learnable scaling after TT
-        self.output_scale = nn.Parameter(torch.ones(1))
+        # Activation function for output stabilization
+        self.activation = nn.GELU()  # Consistent with rest of architecture
         
         self.output_size = rank * 3
         
@@ -174,9 +174,6 @@ class NormalizedDirectTensorTrain3D(nn.Module):
             x_norm = self.norm(x_norm)
         else:
             x_norm = self.norm(x)
-        
-        # Ensure numerical stability - clamp extreme values
-        x_norm = torch.clamp(x_norm, -10.0, 10.0)
         
         # Reshape for processing
         x_flat = x_norm.reshape(batch_size * channels, D, H, W)
@@ -197,8 +194,8 @@ class NormalizedDirectTensorTrain3D(nn.Module):
         # Concatenate mode summaries
         core_summaries = torch.cat([mode1_summary, mode2_summary, mode3_summary], dim=1)
         
-        # Apply learnable scaling
-        core_summaries = core_summaries * self.output_scale
+        # Apply activation function for stabilization and non-linearity
+        core_summaries = self.activation(core_summaries)
         
         # Reshape back to batch format
         output = core_summaries.reshape(batch_size, channels * self.output_size)
