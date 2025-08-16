@@ -2,16 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+from typing import Tuple
 
 ###############################################################################
-# Global Attention Module with Skip Connection
+# TorchScript-Compatible Global Attention Module with Skip Connection
 ###############################################################################
 class GlobalAttention3D(nn.Module):
     """
-    TorchScript-compatible global attention module for 3D feature maps with skip connection.
+    Fully TorchScript-compatible global attention module for 3D feature maps with skip connection.
     """
     
-    def __init__(self, in_channels=64, embed_dim=128, output_dim=64, num_heads=2):
+    def __init__(self, in_channels: int = 64, embed_dim: int = 128, output_dim: int = 64, 
+                 num_heads: int = 2, max_seq_len: int = 1000):
         super(GlobalAttention3D, self).__init__()
         
         self.in_channels = in_channels
@@ -19,6 +21,7 @@ class GlobalAttention3D(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
         
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         
@@ -34,27 +37,19 @@ class GlobalAttention3D(nn.Module):
         # Map from embedding dimension to output channels
         self.output_proj = nn.Linear(embed_dim, output_dim)
         
-        # Skip connection projection (if input/output channels differ)
-        self.skip_proj = None
-        if in_channels != output_dim:
-            self.skip_proj = nn.Conv3d(in_channels, output_dim, kernel_size=1, bias=False)
-            self.skip_bn = nn.BatchNorm3d(output_dim)
-        
-        # Learnable positional encoding will be initialized based on input size
-        self.pos_encoding = None
+        # Pre-allocated positional encoding (TorchScript compatible)
+        self.register_buffer('pos_encoding', torch.randn(1, max_seq_len, embed_dim) * 0.02)
         self.scale = self.head_dim ** -0.5
         
-        # Optional: learnable gate for skip connection strength
+        # Always create skip projection modules (TorchScript compatible)
+        self.skip_proj = nn.Conv3d(in_channels, output_dim, kernel_size=1, bias=False)
+        self.skip_bn = nn.BatchNorm3d(output_dim)
+        self.use_skip_proj = (in_channels != output_dim)
+        
+        # Learnable gate for skip connection strength
         self.gate = nn.Parameter(torch.tensor(0.1))
         
-    def _init_positional_encoding(self, D, H, W, device):
-        """Initialize learnable positional encoding for DxHxW spatial positions"""
-        num_positions = D * H * W
-        pos_encoding = torch.randn(1, num_positions, self.embed_dim, device=device)
-        nn.init.normal_(pos_encoding, std=0.02)
-        self.pos_encoding = nn.Parameter(pos_encoding)
-        
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (batch_size, channels, D, H, W)
         Returns: (batch_size, output_dim, D, H, W)
@@ -65,10 +60,6 @@ class GlobalAttention3D(nn.Module):
         # Store input for skip connection
         skip_input = x
         
-        # Initialize positional encoding on first forward pass
-        if self.pos_encoding is None:
-            self._init_positional_encoding(D, H, W, x.device)
-        
         # Reshape to treat spatial positions as sequence tokens
         x_flat = x.permute(0, 2, 3, 4, 1).contiguous()
         x_flat = x_flat.view(batch_size, seq_len, channels)
@@ -76,8 +67,8 @@ class GlobalAttention3D(nn.Module):
         # Project to embedding dimension
         x_flat = self.channel_proj(x_flat)
         
-        # Add positional encoding
-        x_flat = x_flat + self.pos_encoding
+        # Add positional encoding (slice to current sequence length)
+        x_flat = x_flat + self.pos_encoding[:, :seq_len, :]
         
         # Manual multi-head attention
         q = self.q_proj(x_flat)
@@ -109,11 +100,10 @@ class GlobalAttention3D(nn.Module):
         output = output.permute(0, 2, 1)
         output = output.view(batch_size, self.output_dim, D, H, W)
         
-        # Skip connection
-        if self.skip_proj is not None:
-            # Project skip input to match output dimensions
-            skip_input = self.skip_proj(skip_input)
-            skip_input = self.skip_bn(skip_input)
+        # Skip connection (always apply projection, but conditionally use it)
+        projected_skip = self.skip_bn(self.skip_proj(skip_input))
+        if self.use_skip_proj:
+            skip_input = projected_skip
         
         # Add skip connection with learnable gate
         output = output + self.gate * skip_input
@@ -122,34 +112,27 @@ class GlobalAttention3D(nn.Module):
 
 
 ###############################################################################
-# Normalized Tensor Train Module
+# TorchScript-Compatible Normalized Tensor Train Module
 ###############################################################################
 class NormalizedDirectTensorTrain3D(nn.Module):
     """
-    Direct tensor train with pre-normalization for stability.
+    TorchScript-compatible direct tensor train with pre-normalization for stability.
     """
     
-    def __init__(self, input_shape, rank=64, norm_type='batch'):
+    def __init__(self, input_shape: Tuple[int, int, int, int], rank: int = 64, norm_type: int = 0):
         super(NormalizedDirectTensorTrain3D, self).__init__()
         
         self.channels, self.D, self.H, self.W = input_shape
         self.rank = rank
         self.norm_type = norm_type
         
-        # Add normalization before TT decomposition
-        if norm_type == 'batch':
-            self.norm = nn.BatchNorm3d(self.channels)
-        elif norm_type == 'layer':
-            # LayerNorm over spatial dimensions
-            self.norm = nn.LayerNorm([self.D, self.H, self.W])
-        elif norm_type == 'group':
-            # GroupNorm with 8 groups (adjust based on channels)
-            num_groups = min(8, self.channels)
-            self.norm = nn.GroupNorm(num_groups, self.channels)
-        elif norm_type == 'instance':
-            self.norm = nn.InstanceNorm3d(self.channels)
-        else:
-            self.norm = nn.Identity()
+        # Always create all normalization types (TorchScript compatible)
+        self.batch_norm = nn.BatchNorm3d(self.channels)
+        self.layer_norm = nn.LayerNorm([self.D, self.H, self.W])
+        num_groups = min(8, self.channels)
+        self.group_norm = nn.GroupNorm(num_groups, self.channels)
+        self.instance_norm = nn.InstanceNorm3d(self.channels)
+        self.identity = nn.Identity()
         
         # TT cores with improved initialization
         self.core1 = nn.Parameter(torch.randn(1, self.D, rank) * (2.0 / (self.D + rank)) ** 0.5)
@@ -157,23 +140,27 @@ class NormalizedDirectTensorTrain3D(nn.Module):
         self.core3 = nn.Parameter(torch.randn(rank, self.W, 1) * (2.0 / (self.W + rank)) ** 0.5)
         
         # Activation function for output stabilization
-        self.activation = nn.GELU()  # Consistent with rest of architecture
+        self.activation = nn.GELU()
         
         self.output_size = rank * 3
         
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply normalization then tensor train decomposition.
         """
         batch_size, channels, D, H, W = x.shape
         
-        # Normalize input for stability
-        if self.norm_type == 'layer':
-            # LayerNorm expects (batch, ..., normalized_dims)
-            x_norm = x.permute(0, 1, 2, 3, 4)  # Keep as is for 3D LayerNorm
-            x_norm = self.norm(x_norm)
-        else:
-            x_norm = self.norm(x)
+        # Apply normalization based on norm_type (TorchScript compatible)
+        if self.norm_type == 0:  # 'batch'
+            x_norm = self.batch_norm(x)
+        elif self.norm_type == 1:  # 'layer'
+            x_norm = self.layer_norm(x)
+        elif self.norm_type == 2:  # 'group'
+            x_norm = self.group_norm(x)
+        elif self.norm_type == 3:  # 'instance'
+            x_norm = self.instance_norm(x)
+        else:  # 'none'
+            x_norm = self.identity(x)
         
         # Reshape for processing
         x_flat = x_norm.reshape(batch_size * channels, D, H, W)
@@ -204,15 +191,14 @@ class NormalizedDirectTensorTrain3D(nn.Module):
 
 
 ###############################################################################
-# 3D Residual Block
+# TorchScript-Compatible 3D Residual Block
 ###############################################################################
 class ResidualBlock3D(nn.Module):
     """
-    A 3D adaptation of a 2-layer residual block.
-    Uses (3,3,3) kernels and a skip connection.
+    TorchScript-compatible 3D adaptation of a 2-layer residual block.
     """
 
-    def __init__(self, in_channels, out_channels, stride=(1, 2, 2)):
+    def __init__(self, in_channels: int, out_channels: int, stride: Tuple[int, int, int] = (1, 2, 2)):
         super(ResidualBlock3D, self).__init__()
 
         # First 3D conv
@@ -241,27 +227,24 @@ class ResidualBlock3D(nn.Module):
 
         self.activation = nn.GELU()
 
-        # Shortcut for matching dimensions
-        self.shortcut = None
-        if stride != (1, 1, 1) or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels,
-                          kernel_size=1,
-                          stride=stride,
-                          bias=False),
-                nn.BatchNorm3d(out_channels)
-            )
+        # Always create shortcut modules (TorchScript compatible)
+        self.shortcut_conv = nn.Conv3d(in_channels, out_channels,
+                                      kernel_size=1,
+                                      stride=stride,
+                                      bias=False)
+        self.shortcut_bn = nn.BatchNorm3d(out_channels)
+        self.use_shortcut = (stride != (1, 1, 1) or in_channels != out_channels)
 
-    def _apply_circular_padding(self, x):
+    def _apply_circular_padding(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply circular padding for width axis and regular padding for time and height.
         """
         # Circular padding for width, constant for others
         x = torch.nn.functional.pad(x, (1, 1, 0, 0, 0, 0), mode='circular')
-        x = torch.nn.functional.pad(x, (0, 0, 1, 1, 1, 1), mode='constant', value=0)
+        x = torch.nn.functional.pad(x, (0, 0, 1, 1, 1, 1), mode='constant', value=0.0)
         return x
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Main path
         out = self._apply_circular_padding(x)
         out = self.conv1(out)
@@ -272,9 +255,10 @@ class ResidualBlock3D(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
 
-        # Shortcut
-        if self.shortcut is not None:
-            x = self.shortcut(x)
+        # Shortcut (always compute, conditionally use)
+        shortcut_out = self.shortcut_bn(self.shortcut_conv(x))
+        if self.use_shortcut:
+            x = shortcut_out
 
         # Residual connection
         out += x
@@ -289,19 +273,20 @@ class ResidualBlock3D(nn.Module):
 
 
 ###############################################################################
-# PetNetImproved3D with Skip Connection in Global Attention
+# TorchScript-Compatible PetNetImproved3D
 ###############################################################################
 class PetNetImproved3D(nn.Module):
     """
-    PetNet with normalized tensor train decomposition and skip connection in global attention.
+    Fully TorchScript-compatible PetNet with static tensor train initialization.
     """
 
-    def __init__(self, num_classes=6, tt_rank=32, norm_type='batch'):
-        print(f"Loading PetnetImproved3D Model with Normalized Tensor Train (norm_type={norm_type}) and Skip Connection in Global Attention...")
+    def __init__(self, num_classes: int = 6, tt_rank: int = 32, norm_type: int = 0, 
+                 input_shape: Tuple[int, int, int, int] = (2, 3, 207, 41)):
         super(PetNetImproved3D, self).__init__()
 
         self.tt_rank = tt_rank
         self.norm_type = norm_type
+        self.input_shape = input_shape
 
         # Initial 3D conv: 2 => 16 channels
         self.conv_in = nn.Conv3d(in_channels=2, out_channels=16,
@@ -314,121 +299,109 @@ class PetNetImproved3D(nn.Module):
         self.layer1 = ResidualBlock3D(16, 32, stride=(1, 2, 2))
         self.layer2 = ResidualBlock3D(32, 64, stride=(1, 2, 2))
 
-        # Global attention after layer2 (64 input channels, 64 output channels for clean skip)
+        # Global attention after layer2
+        # Calculate max_seq_len based on worst-case scenario after layer2
+        max_seq_len = self._estimate_max_seq_len(input_shape)
         self.global_attention = GlobalAttention3D(
             in_channels=64, 
             embed_dim=128, 
-            output_dim=64,  # Keep same as input for clean skip connection
-            num_heads=8
+            output_dim=64,
+            num_heads=8,
+            max_seq_len=max_seq_len
         )
 
         # Remaining residual blocks
         self.layer3 = ResidualBlock3D(64, 128, stride=(1, 2, 2))
         self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))
 
-        # Normalized Tensor Train decomposition (initialized dynamically)
-        self.tensor_train = None
+        # **STATIC TENSOR TRAIN INITIALIZATION**
+        feature_shape = self._compute_feature_shape(input_shape)
+        self.tensor_train = NormalizedDirectTensorTrain3D(
+            feature_shape, 
+            rank=self.tt_rank,
+            norm_type=self.norm_type
+        )
         
         self.dropout = nn.Dropout(0.3)
 
-        # Compute FC input features dynamically
-        fc_in_features = self._compute_fc_input_size()
+        # Compute FC input features
+        fc_in_features = feature_shape[0] * self.tensor_train.output_size
         self.fc1 = nn.Linear(fc_in_features, 1024, bias=True)
         self.fc2 = nn.Linear(1024, num_classes, bias=True)
 
         self._initialize_weights()
 
-    def _compute_fc_input_size(self, C=2, T=3, H=207, W=41):
+    def _estimate_max_seq_len(self, input_shape: Tuple[int, int, int, int]) -> int:
         """
-        Runs a dummy forward pass to determine TT output size.
+        Estimate maximum sequence length for positional encoding buffer.
         """
+        C, T, H, W = input_shape
+        # Conservative estimate: assume minimal downsampling
+        # After 2 layers with stride (1,2,2), roughly: T, H//4, W//4
+        max_t = T + 10  # Add buffer
+        max_h = (H // 4) + 10
+        max_w = (W // 4) + 10
+        return max_t * max_h * max_w
+
+    def _compute_feature_shape(self, input_shape: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        """
+        Compute feature map shape by running a dummy tensor through the conv layers.
+        TorchScript compatible version.
+        """
+        C, T, H, W = input_shape
+        
         with torch.no_grad():
+            # Create dummy input
             dummy = torch.zeros(1, C, T, H, W)
-            out = self.conv_in(dummy)
-            out = self.bn_in(out)
-            out = self.activation(out)
+            
+            # Run through conv layers in order
+            x = self.conv_in(dummy)
+            x = self.bn_in(x)
+            x = self.activation(x)
+            
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.global_attention(x)
+            x = self.layer3(x)
+            x = self.layer4(x)
+            
+            # Return shape without batch dimension
+            return (int(x.shape[1]), int(x.shape[2]), int(x.shape[3]), int(x.shape[4]))
 
-            out = self.layer1(out)
-            out = self.layer2(out)
-            
-            # Apply attention after layer2 (now with skip connection)
-            out = self.global_attention(out)
-            
-            out = self.layer3(out)
-            out = self.layer4(out)
-            
-            # Initialize normalized tensor train
-            if self.tensor_train is None:
-                feature_shape = out.shape[1:]  # (channels, D, H, W)
-                self.tensor_train = NormalizedDirectTensorTrain3D(
-                    feature_shape, 
-                    rank=self.tt_rank,
-                    norm_type=self.norm_type
-                )
-            
-            # Get TT output size
-            tt_output = self.tensor_train(out)
-            return tt_output.shape[1]
-
-    def forward(self, x, debug=False):
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
-        x: expected shape (batch_size, 2, T, 496, 84)
+        x: expected shape (batch_size, 2, T, H, W)
         """
         # Initial conv
-        if debug: print(f"{x.shape} Input shape")
         x = self.conv_in(x)
-        if debug: print(f"{x.shape} After conv_in")
         x = self.bn_in(x)
-        if debug: print(f"{x.shape} After bn_input")
         x = self.activation(x)
-        if debug: print(f"{x.shape} After activation")
 
         # Residual blocks
         x = self.layer1(x)
-        if debug: print(f"{x.shape} After layer 1")
         x = self.layer2(x)
-        if debug: print(f"{x.shape} After layer 2")
 
         # Global attention with skip connection
         x = self.global_attention(x)
-        if debug: print(f"{x.shape} After global attention (with skip)")
         
         x = self.layer3(x)
-        if debug: print(f"{x.shape} After layer 3")
         x = self.layer4(x)
-        if debug: print(f"{x.shape} After layer 4")
         
         # Ensure tensor is contiguous before tensor train
         x = x.contiguous()
 
-        # Initialize normalized tensor train on first forward pass
-        if self.tensor_train is None:
-            feature_shape = x.shape[1:]  # (channels, D, H, W)
-            print(f"Initializing Normalized Tensor Train with input shape: {feature_shape}")
-            self.tensor_train = NormalizedDirectTensorTrain3D(
-                feature_shape, 
-                rank=self.tt_rank,
-                norm_type=self.norm_type
-            )
-            if next(self.parameters()).is_cuda:
-                self.tensor_train = self.tensor_train.cuda()
-
         # Apply normalized tensor train decomposition
         x = self.tensor_train(x)
-        if debug: print(f"{x.shape} After normalized tensor train decomposition")
 
         # FC layers
         x = self.fc1(x)
-        if debug: print(f"{x.shape} After fc layer 1")
         x = self.activation(x)
         x = self.dropout(x)
-        if debug: print(f"{x.shape} After activation and dropout")
         x = self.fc2(x)
-        if debug: print(f"{x.shape} After fc layer 2 (output)")
 
         return x
 
-    def _initialize_weights(self):
+    def _initialize_weights(self) -> None:
         """
         Kaiming (He) Initialization for Conv3d and Linear layers.
         """
@@ -452,32 +425,45 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     B = 8
-    # B = 128
-
     C = 2
     T = 3 
-
     H = 207
-    # H = 496
-
     W = 41
-    # W = 84
-    
     CLASSES = 6
 
-    # Model instantiation with normalized TT and skip connection in attention
-    model = PetNetImproved3D(num_classes=CLASSES, tt_rank=32, norm_type='batch').to(device)
+    # Model instantiation with TorchScript-compatible static initialization
+    # norm_type: 0=batch, 1=layer, 2=group, 3=instance, 4=none
+    model = PetNetImproved3D(
+        num_classes=CLASSES, 
+        tt_rank=32, 
+        norm_type=0,  # batch normalization
+        input_shape=(C, T, H, W)
+    ).to(device)
+    
+    # Test TorchScript compatibility
+    try:
+        scripted_model = torch.jit.script(model)
+        print("✅ Model is TorchScript compatible!")
+    except Exception as e:
+        print(f"❌ TorchScript error: {e}")
     
     # Test a dummy pass
     dummy_input = torch.randn(B, C, T, H, W).to(device)
     dummy_target = torch.randn(B, CLASSES).to(device)
-    model.forward(dummy_input, debug=True)
     
-    # Print parameter count after initialization
+    # Test both regular and scripted model
+    output_regular = model(dummy_input)
+    if 'scripted_model' in locals():
+        output_scripted = scripted_model(dummy_input)
+        print(f"Regular model output shape: {output_regular.shape}")
+        print(f"Scripted model output shape: {output_scripted.shape}")
+        print(f"Outputs match: {torch.allclose(output_regular, output_scripted, atol=1e-5)}")
+    
+    # Print parameter count
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {param_count:,}")
 
-    # Dummy training loop to observe loss reduction - EXACTLY AS YOURS
+    # Training loop
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     criterion = nn.MSELoss()
 
