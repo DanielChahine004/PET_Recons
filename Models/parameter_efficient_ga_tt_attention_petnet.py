@@ -570,8 +570,8 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # B = 8
-    B = 128
+    B = 8
+    # B = 128
 
     C = 2
     T = 3 
@@ -588,7 +588,7 @@ if __name__ == "__main__":
     # norm_type: 0=batch, 1=layer, 2=group, 3=instance, 4=none
     model = ParameterEfficientPetNet3D(
         num_classes=CLASSES, 
-        tt_rank=16,        # Reduced from 32
+        tt_rank=42,        # Reduced from 32
         norm_type=0,       # batch normalization
         input_shape=(C, T, H, W)
     ).to(device)
