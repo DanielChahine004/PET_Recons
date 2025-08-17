@@ -621,9 +621,6 @@ if __name__ == "__main__":
     # Print parameter count comparison
     param_count = sum(p.numel() for p in model.parameters())
     print(f"\nParameter-Efficient Model Total parameters: {param_count:,}")
-    
-    # Calculate parameter reduction (estimate from original)
-    print(f"Estimated parameter reduction: ~50-60% compared to original model")
 
     print("\n" + "="*60)
     print("STARTING TRAINING LOOP - PARAMETER-EFFICIENT MODEL")
