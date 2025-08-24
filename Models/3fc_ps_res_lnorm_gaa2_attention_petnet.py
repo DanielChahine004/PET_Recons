@@ -199,7 +199,8 @@ class PetNetImproved3D(nn.Module):
         self.activation = nn.GELU()
 
         self.layer1 = ResidualBlock3D(16, 32, stride=(1, 2, 2))      # downsample H,W
-
+        self.layer2 = ResidualBlock3D(32, 64, stride=(1, 2, 2))\
+        
         # Global attention after layer1 (32 channels)
         self.global_attention = GlobalAttention3D(
             in_channels=64,
@@ -208,8 +209,6 @@ class PetNetImproved3D(nn.Module):
             num_heads=8
         )
 
-
-        self.layer2 = ResidualBlock3D(32, 64, stride=(1, 2, 2))
         self.layer3 = ResidualBlock3D(64, 128, stride=(1, 2, 2))
         self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))
         self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))
@@ -217,13 +216,10 @@ class PetNetImproved3D(nn.Module):
         self.dropout = nn.Dropout(0.3)
 
         fc_in_features = self._compute_fc_input_size()
-        self.fc1 = nn.Linear(fc_in_features, 1024, bias=True)
-        self.fc2 = nn.Linear(1024, num_classes, bias=True)
-
         self.fc1 = nn.Linear(fc_in_features, 1024)
-        self.dropout1 = nn.Dropout(0.4)
+        self.dropout1 = nn.Dropout(0.3)
         self.fc2 = nn.Linear(1024, 256)
-        self.dropout2 = nn.Dropout(0.4)
+        self.dropout2 = nn.Dropout(0.3)
         self.fc3 = nn.Linear(256, num_classes)  # final regressive output
 
         self._initialize_weights()

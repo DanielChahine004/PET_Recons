@@ -1,4 +1,3 @@
-# Modified version with positional features added to input
 # takes attention_petnet.py and places the global attention layer after layer 1
 # for higher dimensional G.A. Employs point-wise seperation convolutions over
 # full fat classical convolutions for an 8-10x reduction in paramater count. 
@@ -7,50 +6,12 @@
 # and layer norm works better for Transformers...we'll see about that). 
 # Uses 3 full connected layers with dropout for a more regression head.   
 # Modified to use windowed attention with 4x4 non-overlapping windows.
-# ADDED: Positional features (height and width indices) to input channels
 
 import torch
 import torch.nn as nn
 
 ###############################################################################
-# Positional Feature Generator
-###############################################################################
-def add_positional_features(x, normalize=True):
-    """
-    Add height and width positional features to input tensor.
-    
-    Args:
-        x: input tensor of shape (batch, channels, D, H, W)
-        normalize: whether to normalize positional features to [0, 1]
-    
-    Returns:
-        tensor of shape (batch, channels + 2, D, H, W) with positional features
-    """
-    batch_size, channels, D, H, W = x.shape
-    device = x.device
-    
-    # Create height indices (0 to H-1) for each position
-    height_indices = torch.arange(H, dtype=torch.float32, device=device)
-    height_indices = height_indices.view(1, 1, 1, H, 1).expand(batch_size, 1, D, H, W)
-    
-    # Create width indices (0 to W-1) for each position  
-    width_indices = torch.arange(W, dtype=torch.float32, device=device)
-    width_indices = width_indices.view(1, 1, 1, 1, W).expand(batch_size, 1, D, H, W)
-    
-    if normalize:
-        # Normalize to [0, 1] range
-        if H > 1:
-            height_indices = height_indices / (H - 1)
-        if W > 1:
-            width_indices = width_indices / (W - 1)
-    
-    # Concatenate original features with positional features
-    x_with_pos = torch.cat([x, height_indices, width_indices], dim=1)
-    
-    return x_with_pos
-
-###############################################################################
-# Windowed Global Attention Module (unchanged)
+# Windowed Global Attention Module
 ###############################################################################
 class WindowedGlobalAttention3D(nn.Module):
     """
@@ -230,7 +191,7 @@ class WindowedGlobalAttention3D(nn.Module):
 
 
 ###############################################################################
-# 3D Residual Block (unchanged)
+# 3D Residual Block
 ###############################################################################
 class ResidualBlock3D(nn.Module):
     """
@@ -323,19 +284,16 @@ class ResidualBlock3D(nn.Module):
 
 
 ###############################################################################
-# PetNetImproved3D with Positional Features
+# PetNetImproved3D with Windowed Global Attention
 ###############################################################################
 class PetNetImproved3D(nn.Module):
-    def __init__(self, num_classes=6, normalize_positions=True):
-        print("Loading PetnetImproved3D Model with Windowed Global Attention and Positional Features...")
+    def __init__(self, num_classes=6):
+        print("Loading PetnetImproved3D Model with Windowed Global Attention...")
         super(PetNetImproved3D, self).__init__()
-        
-        self.normalize_positions = normalize_positions
 
-        # Modified input layer to accept 4 channels (2 original + 2 positional)
         self.conv_in = nn.Sequential(
-            nn.Conv3d(4, 4, kernel_size=3, stride=1, padding=1, groups=4, bias=False),    # depthwise (now 4 groups)
-            nn.Conv3d(4, 16, kernel_size=1, stride=1, padding=0, bias=False)              # pointwise
+            nn.Conv3d(2, 2, kernel_size=3, stride=1, padding=1, groups=2, bias=False),    # depthwise
+            nn.Conv3d(2, 16, kernel_size=1, stride=1, padding=0, bias=False)              # pointwise
         )
         self.bn_in = nn.BatchNorm3d(16)
         self.activation = nn.GELU()
@@ -369,11 +327,7 @@ class PetNetImproved3D(nn.Module):
 
     def _compute_fc_input_size(self, C=2, T=3, H=207, W=41):
         with torch.no_grad():
-            # Create dummy input with original channels
             dummy = torch.zeros(1, C, T, H, W)
-            # Add positional features
-            dummy = add_positional_features(dummy, normalize=self.normalize_positions)
-            
             out = self.conv_in(dummy)
             out = self.bn_in(out)
             out = self.activation(out)
@@ -389,11 +343,6 @@ class PetNetImproved3D(nn.Module):
 
     def forward(self, x, debug=False): 
         if debug: print(f"{x.shape} Input shape")
-        
-        # Add positional features (height and width indices)
-        x = add_positional_features(x, normalize=self.normalize_positions)
-        if debug: print(f"{x.shape} After adding positional features")
-        
         x = self.conv_in(x)
         if debug: print(f"{x.shape} After conv_in")
         x = self.bn_in(x)
@@ -458,7 +407,7 @@ if __name__ == "__main__":
     B = 1
     # B = 128
 
-    C = 2  # Original channels
+    C = 2
     T = 3 
 
     H = 207
@@ -470,18 +419,15 @@ if __name__ == "__main__":
     CLASSES = 6
 
     # Model instantiation
-    model = PetNetImproved3D(num_classes=CLASSES, normalize_positions=True).to(device)
+    model = PetNetImproved3D(num_classes=CLASSES).to(device)
     
     # Print parameter count
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {param_count:,}")
     
-    # Test a dummy pass - note input still has original 2 channels
-    # The positional features are added inside the forward pass
+    # Test a dummy pass
     dummy_input = torch.randn(B, C, T, H, W).to(device)
     dummy_target = torch.randn(B, CLASSES).to(device)
-    
-    print("Testing forward pass with positional features...")
     model.forward(dummy_input, debug=True)
 
     # Dummy training loop to observe loss reduction

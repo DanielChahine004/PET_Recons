@@ -199,30 +199,27 @@ class PetNetImproved3D(nn.Module):
         self.activation = nn.GELU()
 
         self.layer1 = ResidualBlock3D(16, 32, stride=(1, 2, 2))      # downsample H,W
-
+        
         # Global attention after layer1 (32 channels)
         self.global_attention = GlobalAttention3D(
             in_channels=32,
             embed_dim=128,
-            output_dim=32,     # must match "out_channels"
+            output_dim=32,
             num_heads=8
         )
 
         self.layer2 = ResidualBlock3D(32, 64, stride=(1, 2, 2))
         self.layer3 = ResidualBlock3D(64, 128, stride=(1, 2, 2))
         self.layer4 = ResidualBlock3D(128, 256, stride=(1, 2, 2))
-        self.layer5 = ResidualBlock3D(256, 512, stride=(1, 2, 2))
+        self.layer5 = ResidualBlock3D(256, 256, stride=(1, 2, 2))
 
         self.dropout = nn.Dropout(0.3)
 
         fc_in_features = self._compute_fc_input_size()
-        self.fc1 = nn.Linear(fc_in_features, 1024, bias=True)
-        self.fc2 = nn.Linear(1024, num_classes, bias=True)
-
         self.fc1 = nn.Linear(fc_in_features, 1024)
-        self.dropout1 = nn.Dropout(0.4)
+        self.dropout1 = nn.Dropout(0.3)
         self.fc2 = nn.Linear(1024, 256)
-        self.dropout2 = nn.Dropout(0.4)
+        self.dropout2 = nn.Dropout(0.3)
         self.fc3 = nn.Linear(256, num_classes)  # final regressive output
 
         self._initialize_weights()
@@ -234,16 +231,16 @@ class PetNetImproved3D(nn.Module):
             out = self.bn_in(out)
             out = self.activation(out)
             out = self.layer1(out)
-            # Global attention after layer1
-            out = self.global_attention(out)
+            out = self.global_attention(out) # Global attention after layer1
             out = self.layer2(out)
             out = self.layer3(out)
             out = self.layer4(out)
             out = self.layer5(out)
-            out = torch.mean(out, dim=(2, 3, 4))
+            out = out.view(out.size(0), -1)
             return out.shape[1]
 
-    def forward(self, x, debug=False):
+
+    def forward(self, x, debug=False): 
         if debug: print(f"{x.shape} Input shape")
         x = self.conv_in(x)
         if debug: print(f"{x.shape} After conv_in")
@@ -255,9 +252,9 @@ class PetNetImproved3D(nn.Module):
         x = self.layer1(x)
         if debug: print(f"{x.shape} After layer 1")
 
-        # Move attention here
+        # Global attention after layer 1
         x = self.global_attention(x)
-        if debug: print(f"{x.shape} After global attention (now after layer 1)")
+        if debug: print(f"{x.shape} After global attention (after layer 1)")
 
         x = self.layer2(x)
         if debug: print(f"{x.shape} After layer 2")
@@ -268,8 +265,8 @@ class PetNetImproved3D(nn.Module):
         x = self.layer5(x)
         if debug: print(f"{x.shape} After layer 5")
 
-        x = torch.mean(x, dim=(2, 3, 4))
-        if debug: print(f"{x.shape} After global average pooling")
+        x = x.view(x.size(0), -1)  # Flatten all features (B, all_channels)
+        if debug: print(f"{x.shape} After flattening all channels/voxels")
         x = self.fc1(x)
         x = self.activation(x)
         x = self.dropout1(x)
@@ -282,6 +279,7 @@ class PetNetImproved3D(nn.Module):
         if debug: print(f"{x.shape} After fc layer 3 (output)")
 
         return x
+
 
     def _initialize_weights(self):
         """
