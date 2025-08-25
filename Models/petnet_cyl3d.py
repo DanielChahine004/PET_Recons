@@ -1,3 +1,22 @@
+# Modified version with positional features added to input
+# takes attention_petnet.py and places the global attention layer after layer 1
+# for higher dimensional G.A. Employs point-wise seperation convolutions over
+# full fat classical convolutions for an 8-10x reduction in paramater count. 
+# Also introduces a residual connection after the global attention, and layer norm
+# for the global attention (Apparently batch norm works better for Convolutions, 
+# and layer norm works better for Transformers...we'll see about that). 
+# Uses 3 full connected layers with dropout for a more regression head.   
+# Modified to use windowed attention with 4x4 non-overlapping windows.
+# ADDED: Positional features (height and width indices) to input channels
+
+import torch
+import torch.nn as nn
+
+###############################################################################
+# Positional Feature Generator
+###############################################################################
+
+
 # petnet_cyl3d.py
 from typing import Tuple, Literal
 
@@ -185,14 +204,14 @@ class PetNetCyl3D(nn.Module):
             nn.Linear(head_input_dim, 16, bias=True),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(16, 3, bias=True)
+            nn.Linear(16, 4, bias=True)
         )
 
         self.head_outer = nn.Sequential(
             nn.Linear(head_input_dim, 16, bias=True),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(16, 3, bias=True)
+            nn.Linear(16, 4, bias=True)
         )
 
         self._init_weights()
@@ -251,6 +270,7 @@ class PetNetCyl3DCompact(nn.Module):
             in_channels: int = 4,
             base_channels: int = 6,  # Very small base
             dropout_rate: float = 0.7,  # Aggressive dropout
+            out_features: int = 6,  # Aggressive dropout
     ):
         super().__init__()
         print("Loading PetNetCyl3D Compact (minimal overfitting)")
@@ -278,7 +298,7 @@ class PetNetCyl3DCompact(nn.Module):
             nn.Linear(base_channels * 4, 32),
             nn.GELU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(32, 6)
+            nn.Linear(32, out_features)
         )
 
     def forward(self, x):
@@ -287,6 +307,63 @@ class PetNetCyl3DCompact(nn.Module):
         return self.head(x)
     
     
+
+# -----------------------------------------------------------
+# PetNetCyl3D with custom output pooling dimensions
+# -----------------------------------------------------------
+class PetNetCyl3DCustomPool(nn.Module):
+    """Ultra-compact version with custom output pooling dimensions."""
+
+    def __init__(
+            self,
+            in_channels: int = 4,
+            base_channels: int = 6,  # Very small base
+            dropout_rate: float = 0.7,  # Aggressive dropout
+            out_features: int = 6,
+            output_timesteps: int = 8,  # T dimension for output
+            output_height: int = 16,    # H dimension for output  
+            output_width: int = 16,     # W dimension for output
+    ):
+        super().__init__()
+        print(f"Loading PetNetCyl3D Custom Pool (output: {output_timesteps}x{output_height}x{output_width})")
+
+        self.backbone = nn.Sequential(
+            Conv3dCircW(in_channels, base_channels, 3, (1, 1, 1)),
+            nn.GroupNorm(2, base_channels),
+            nn.GELU(),
+            nn.Dropout3d(0.2),
+
+            Conv3dCircW(base_channels, base_channels * 2, 3, (1, 2, 2)),
+            nn.GroupNorm(2, base_channels * 2),
+            nn.GELU(),
+            nn.Dropout3d(0.3),
+
+            Conv3dCircW(base_channels * 2, base_channels * 4, 3, (1, 2, 2)),
+            nn.GroupNorm(4, base_channels * 4),
+            nn.GELU(),
+            nn.Dropout3d(0.4),
+        )
+
+        # Custom adaptive pooling to specified dimensions
+        self.adaptive_pool = nn.AdaptiveAvgPool3d((output_timesteps, output_height, output_width))
+        
+        # Calculate flattened feature size
+        self.flattened_features = base_channels * 4 * output_timesteps * output_height * output_width
+
+        self.head = nn.Sequential(
+            nn.Linear(self.flattened_features, 32),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(32, out_features)
+        )
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = self.adaptive_pool(x)  # Shape: (batch, channels, T, H, W)
+        x = x.flatten(1)           # Shape: (batch, channels * T * H * W)
+        return self.head(x)
+
+
 # -----------------------------------------------------------
 # Compact version without GAP (uses full feature map)
 # -----------------------------------------------------------
@@ -727,12 +804,13 @@ class WindowedAttention3D(nn.Module):
 
 
 # -----------------------------------------------------------
-# PetNetCyl3D with Windowed Attention
+# PetNetCyl3D with Windowed Attention and Multiple FC Heads
 # -----------------------------------------------------------
 class PetNetCyl3DWindowedAttention(nn.Module):
     """
     PetNet with windowed attention applied after first convolution.
     Two successive attention blocks: width-windowed, then height-windowed.
+    Multiple specialized FC heads for each output channel.
     TorchScript compatible.
     """
 
@@ -740,16 +818,20 @@ class PetNetCyl3DWindowedAttention(nn.Module):
         self,
         in_channels: int = 4,
         base_channels: int = 6,
-        input_shape=(2, 3, 207, 41),  # (C, T, H, W)
+        input_shape=(2, 3, 207, 41),  # (C, T, H, W) - original channels before positional
         dropout_rate: float = 0.5,
         out_features: int = 6,
         window_size: int = 8,  # Window size for attention
         attn_heads: int = 2,
+        normalize_positions: bool = True,
     ):
         super().__init__()
-        print("Loading PetNetCyl3D (Windowed Attention, TorchScript Compatible)")
+        print("Loading PetNetCyl3D (Windowed Attention, Multiple FC Heads, TorchScript Compatible)")
+        
+        self.normalize_positions = normalize_positions
+        self.out_features = out_features
 
-        # First convolution
+        # First convolution (input channels = 4 after adding positional features)
         self.conv1 = nn.Conv3d(in_channels, base_channels, kernel_size=3, stride=(1, 1, 1), padding=1)
         self.norm1 = nn.GroupNorm(2, base_channels)
         self.act1 = nn.GELU()
@@ -781,22 +863,45 @@ class PetNetCyl3DWindowedAttention(nn.Module):
         self.act3 = nn.GELU()
         self.drop3 = nn.Dropout3d(0.4)
 
-        # Precompute flatten_dim from input shape
+        # Precompute flatten_dim from input shape (with positional features)
         flatten_dim = self._compute_flatten_dim(in_channels, input_shape)
         print(f"[Init] Flattened feature size = {flatten_dim}")
 
-        # Fully connected head
-        self.head = nn.Sequential(
-            nn.Linear(flatten_dim, 128),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(128, out_features)
-        )
+        # Shared feature extraction layers
+        self.shared_fc1 = nn.Linear(flatten_dim, 256)
+        self.shared_dropout1 = nn.Dropout(dropout_rate)
+        self.shared_fc2 = nn.Linear(256, 128)
+        self.shared_dropout2 = nn.Dropout(dropout_rate)
+
+        # Individual FC heads for each output channel
+        self.fc_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(128, 64),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, 32),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(32, 1)
+            ) for _ in range(out_features)
+        ])
+
+        # Alternative: Simpler individual heads (uncomment to use)
+        # self.fc_heads = nn.ModuleList([
+        #     nn.Sequential(
+        #         nn.Linear(128, 64),
+        #         nn.GELU(),
+        #         nn.Dropout(0.3),
+        #         nn.Linear(64, 1)
+        #     ) for _ in range(out_features)
+        # ])
 
     def _compute_flatten_dim(self, in_channels, input_shape):
         """Compute feature map flatten size at init time (TorchScript safe)."""
         C, T, H, W = input_shape
+        # Create dummy input with original channels
         dummy = torch.zeros(1, C, T, H, W)
+        
         with torch.no_grad():
             # Forward through full model pipeline
             x = self.act1(self.norm1(self.conv1(dummy)))
@@ -811,9 +916,11 @@ class PetNetCyl3DWindowedAttention(nn.Module):
             x = self.drop2(x)
             x = self.act3(self.norm3(self.conv3(x)))
             x = self.drop3(x)
+            
         return x.numel()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         # First convolution
         x = self.act1(self.norm1(self.conv1(x)))
         x = self.drop1(x)
@@ -829,9 +936,115 @@ class PetNetCyl3DWindowedAttention(nn.Module):
         x = self.act3(self.norm3(self.conv3(x)))
         x = self.drop3(x)
         
-        # Flatten and pass through head
+        # Flatten and pass through shared feature extraction
         x = torch.flatten(x, 1)
-        return self.head(x)
+        
+        # Shared feature extraction
+        x = self.shared_fc1(x)
+        x = self.act1(x)  # Reuse activation
+        x = self.shared_dropout1(x)
+        
+        x = self.shared_fc2(x)
+        x = self.act1(x)  # Reuse activation
+        x = self.shared_dropout2(x)
+        
+        # Apply individual FC heads
+        outputs = []
+        for head in self.fc_heads:
+            head_output = head(x)  # Shape: (batch_size, 1)
+            outputs.append(head_output)
+        
+        # Concatenate all head outputs
+        final_output = torch.cat(outputs, dim=1)  # Shape: (batch_size, out_features)
+        
+        return final_output
+
+    def get_head_outputs(self, x: torch.Tensor):
+        """
+        Get outputs from each head separately (useful for analysis/debugging).
+        
+        Returns:
+            List of tensors, each of shape (batch_size, 1)
+        """
+        # Forward through shared layers
+        x = add_positional_features(x, normalize=self.normalize_positions)
+        x = self.act1(self.norm1(self.conv1(x)))
+        x = self.drop1(x)
+        x = self.width_attention(x)
+        x = self.height_attention(x)
+        x = self.act2(self.norm2(self.conv2(x)))
+        x = self.drop2(x)
+        x = self.act3(self.norm3(self.conv3(x)))
+        x = self.drop3(x)
+        x = torch.flatten(x, 1)
+        x = self.shared_fc1(x)
+        x = self.act1(x)
+        x = self.shared_dropout1(x)
+        x = self.shared_fc2(x)
+        x = self.act1(x)
+        x = self.shared_dropout2(x)
+        
+        # Get individual head outputs
+        head_outputs = []
+        for head in self.fc_heads:
+            head_output = head(x)
+            head_outputs.append(head_output)
+        
+        return head_outputs
+
+    def get_feature_maps(self, x: torch.Tensor, return_attention_maps: bool = False):
+        """
+        Extract intermediate feature maps for visualization/analysis.
+        
+        Args:
+            x: Input tensor
+            return_attention_maps: Whether to return attention maps from windowed attention
+        
+        Returns:
+            Dictionary containing feature maps at different stages
+        """
+        feature_maps = {}
+        
+        x = add_positional_features(x, normalize=self.normalize_positions)
+        feature_maps['input_with_pos'] = x.clone()
+        
+        # After first conv
+        x = self.act1(self.norm1(self.conv1(x)))
+        feature_maps['after_conv1'] = x.clone()
+        x = self.drop1(x)
+        
+        # After attention blocks
+        x = self.width_attention(x)
+        feature_maps['after_width_attention'] = x.clone()
+        x = self.height_attention(x)
+        feature_maps['after_height_attention'] = x.clone()
+        
+        # After remaining convolutions
+        x = self.act2(self.norm2(self.conv2(x)))
+        feature_maps['after_conv2'] = x.clone()
+        x = self.drop2(x)
+        
+        x = self.act3(self.norm3(self.conv3(x)))
+        feature_maps['after_conv3'] = x.clone()
+        x = self.drop3(x)
+        
+        # Flattened features
+        x = torch.flatten(x, 1)
+        feature_maps['flattened'] = x.clone()
+        
+        # After shared FC layers
+        x = self.shared_fc1(x)
+        x = self.act1(x)
+        x = self.shared_dropout1(x)
+        feature_maps['after_shared_fc1'] = x.clone()
+        
+        x = self.shared_fc2(x)
+        x = self.act1(x)
+        x = self.shared_dropout2(x)
+        feature_maps['after_shared_fc2'] = x.clone()
+        
+        return feature_maps
+
 
 # -----------------------------------------------------------
 # Test
@@ -848,7 +1061,7 @@ if __name__ == "__main__":
     compact_model = PetNetCyl3DCompact(in_channels=C)
     y_pred_compact = compact_model(x)
     print(f"Compact model output shape: {y_pred_compact.shape}")
-    
+
     full_model = PetNetCyl3DFullFeatures(in_channels=C, base_channels=6, out_features=6)
     y_pred_full = full_model(x)
     print(f"Full model output shape: {y_pred_full.shape}")
@@ -862,17 +1075,15 @@ if __name__ == "__main__":
     y_pred_dw = depthwise_model(x)
     print(f"Depthwise model output shape: {y_pred_dw.shape}")
 
-    windowed_model = PetNetCyl3DWindowedAttention(
-        in_channels=C, 
-        base_channels=6, 
-        out_features=6,
-        window_size=8,
-        attn_heads=2
-    )
+    windowed_model = PetNetCyl3DWindowedAttention(in_channels=C, base_channels=6, 
+        out_features=6, window_size=8, attn_heads=2)
     y_pred_window = depthwise_model(x)
     print(f"Windowed model output shape: {y_pred_window.shape}")
 
-
+    custom_pool = PetNetCyl3DCustomPool(in_channels=C, base_channels=6, out_features=6,
+                                       output_timesteps=T, output_height=H, output_width=W)
+    y_pred_custom = custom_pool(x)
+    print(f"Custom pool model output shape: {y_pred_custom.shape}")
 
     # Count parameters
     def count_params(model):
@@ -884,4 +1095,5 @@ if __name__ == "__main__":
     print(f"Full attention model parameters: {count_params(full_attn_model):,}")
     print(f"DW model parameters: {count_params(depthwise_model):,}")
     print(f"Windowed model parameters: {count_params(windowed_model):,}")
+    print(f"Custom pool model parameters: {count_params(custom_pool):,}")
 
