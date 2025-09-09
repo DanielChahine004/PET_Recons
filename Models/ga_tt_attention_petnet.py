@@ -316,7 +316,7 @@ class PetNetImproved3D(nn.Module):
         self.input_shape = input_shape
 
         # Initial 3D conv: 2 => 16 channels
-        self.conv_in = nn.Conv3d(in_channels=2, out_channels=16,
+        self.conv_in = nn.Conv3d(in_channels=input_shape[0], out_channels=16,
                                  kernel_size=3, stride=(1, 1, 1),
                                  padding=1, bias=False)
         self.bn_in = nn.BatchNorm3d(16)

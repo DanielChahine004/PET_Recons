@@ -53,128 +53,127 @@ class CircularPadConv4d(nn.Module):
         return out
 
 
-class AttentionKernelConv(nn.Module):
-    """Attention-based kernel convolution using Q, K, V kernels."""
+class ParallelConvBranch(nn.Module):
+    """Single convolution branch with specific kernel size."""
     
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
+        spatial_kernel: int,
         debug: bool = False
     ):
         super().__init__()
         self.debug = debug
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.spatial_kernel = spatial_kernel
         
-        # 3 parallel branches to learn Q, K, V kernels (each 3x3)
-        self.query_conv = CircularPadConv4d(in_channels, out_channels, spatial_kernel=3)
-        self.key_conv = CircularPadConv4d(in_channels, out_channels, spatial_kernel=3)
-        self.value_conv = CircularPadConv4d(in_channels, out_channels, spatial_kernel=3)
-        
-        # Batch norm and activation for each branch
-        self.q_bn = nn.BatchNorm2d(out_channels)
-        self.k_bn = nn.BatchNorm2d(out_channels)
-        self.v_bn = nn.BatchNorm2d(out_channels)
-        
-        self.activation = nn.ReLU(inplace=True)
-        
-        # Kernel attention mechanism
-        self.kernel_attention = nn.MultiheadAttention(
-            embed_dim=9,  # 3x3 kernel flattened
-            num_heads=1,
-            batch_first=True
+        self.conv = CircularPadConv4d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            spatial_kernel=spatial_kernel
         )
-        
-        # Final convolution using attention-weighted kernel
-        self.final_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.final_bn = nn.BatchNorm2d(out_channels)
-        
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activation = nn.ReLU(inplace=True)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.debug:
-            print(f"AttentionKernelConv input shape: {x.shape}")
-        
-        B, C_in, H, W = x.shape
-        
-        # Generate Q, K, V feature maps through parallel convolutions
-        q_features = self.activation(self.q_bn(self.query_conv(x)))   # (B, C_out, H, W)
-        k_features = self.activation(self.k_bn(self.key_conv(x)))     # (B, C_out, H, W)
-        v_features = self.activation(self.v_bn(self.value_conv(x)))   # (B, C_out, H, W)
-        
-        if self.debug:
-            print(f"Q, K, V features shape: {q_features.shape}")
-        
-        # Extract kernel weights from the convolution layers for attention
-        q_kernel = self.query_conv.conv2d.weight  # (C_out, C_in, 3, 3)
-        k_kernel = self.key_conv.conv2d.weight    # (C_out, C_in, 3, 3)
-        v_kernel = self.value_conv.conv2d.weight  # (C_out, C_in, 3, 3)
-        
-        # Reshape kernels for attention: (C_out, C_in, 3, 3) -> (C_out*C_in, 9)
-        q_flat = q_kernel.view(self.out_channels * C_in, 9)  # (C_out*C_in, 9)
-        k_flat = k_kernel.view(self.out_channels * C_in, 9)  # (C_out*C_in, 9)
-        v_flat = v_kernel.view(self.out_channels * C_in, 9)  # (C_out*C_in, 9)
-        
-        # Add batch dimension for attention
-        q_batch = q_flat.unsqueeze(0).expand(B, -1, -1)  # (B, C_out*C_in, 9)
-        k_batch = k_flat.unsqueeze(0).expand(B, -1, -1)  # (B, C_out*C_in, 9)
-        v_batch = v_flat.unsqueeze(0).expand(B, -1, -1)  # (B, C_out*C_in, 9)
-        
-        if self.debug:
-            print(f"Q, K, V batch shapes for attention: {q_batch.shape}")
-        
-        # Apply kernel-level attention
-        attended_kernel, attention_weights = self.kernel_attention(q_batch, k_batch, v_batch)
-        # attended_kernel: (B, C_out*C_in, 9)
-        
-        # Reshape back to kernel format
-        attended_kernel = attended_kernel.view(B, self.out_channels, C_in, 3, 3)
-        
-        if self.debug:
-            print(f"Attended kernel shape: {attended_kernel.shape}")
-        
-        # Apply the attended kernel to the input using grouped convolution
-        # We'll use the mean attended kernel across batch for simplicity
-        mean_kernel = torch.mean(attended_kernel, dim=0)  # (C_out, C_in, 3, 3)
-        
-        # Temporarily replace the final conv weights with attended kernel
-        with torch.no_grad():
-            # Create a temporary 3x3 conv with the attended kernel
-            temp_conv = nn.Conv2d(C_in, self.out_channels, kernel_size=3, padding=0, bias=False).to(x.device)
-            temp_conv.weight.data = mean_kernel
+            print(f"Branch (kernel={self.spatial_kernel}) input shape: {x.shape}")
             
-        # Apply circular padding to input
-        pad_w = 1  # for 3x3 kernel
-        pad_h = 1
-        
-        if pad_w > 0:
-            x_padded_w = torch.cat([x[..., -pad_w:], x, x[..., :pad_w]], dim=-1)
-        else:
-            x_padded_w = x
-            
-        if pad_h > 0:
-            x_padded = F.pad(x_padded_w, (0, 0, pad_h, pad_h), mode="constant", value=0.0)
-        else:
-            x_padded = x_padded_w
-        
-        # Apply the attended kernel
-        output = temp_conv(x_padded)
-        output = self.final_bn(output)
-        output = self.activation(output)
+        out = self.conv(x)
+        out = self.bn(out)
+        out = self.activation(out)
         
         if self.debug:
-            print(f"AttentionKernelConv output shape: {output.shape}")
+            print(f"Branch (kernel={self.spatial_kernel}) output shape: {out.shape}")
+            
+        return out
+
+
+class ParallelConvBlock(nn.Module):
+    """Parallel convolution block with 3 branches (kernel sizes 1, 3, 5)."""
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels_per_branch: int,
+        debug: bool = False
+    ):
+        super().__init__()
+        self.debug = debug
         
-        return output
+        # 3 parallel branches with different kernel sizes
+        self.branch_1x1 = ParallelConvBranch(
+            in_channels, out_channels_per_branch, spatial_kernel=1, debug=debug
+        )
+        self.branch_3x3 = ParallelConvBranch(
+            in_channels, out_channels_per_branch, spatial_kernel=3, debug=debug
+        )
+        self.branch_5x5 = ParallelConvBranch(
+            in_channels, out_channels_per_branch, spatial_kernel=5, debug=debug
+        )
+        
+        # Total output channels
+        total_out_channels = 3 * out_channels_per_branch
+        
+        # Optional 1x1 conv to reduce channels after concatenation
+        self.channel_reduce = nn.Sequential(
+            nn.Conv2d(total_out_channels, out_channels_per_branch * 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels_per_branch * 2),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Residual connection if needed
+        self.residual_proj = None
+        final_out_channels = out_channels_per_branch * 2
+        if in_channels != final_out_channels:
+            self.residual_proj = nn.Sequential(
+                nn.Conv2d(in_channels, final_out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(final_out_channels)
+            )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.debug:
+            print(f"ParallelConvBlock input shape: {x.shape}")
+        
+        residual = x
+        
+        # Process through parallel branches
+        out_1x1 = self.branch_1x1(x)
+        out_3x3 = self.branch_3x3(x)
+        out_5x5 = self.branch_5x5(x)
+        
+        # Concatenate along channel dimension
+        out = torch.cat([out_1x1, out_3x3, out_5x5], dim=1)
+        
+        if self.debug:
+            print(f"After concatenation: {out.shape}")
+        
+        # Reduce channels
+        out = self.channel_reduce(out)
+        
+        if self.debug:
+            print(f"After channel reduction: {out.shape}")
+        
+        # Residual connection
+        if self.residual_proj is not None:
+            residual = self.residual_proj(residual)
+        
+        out = out + residual
+        
+        if self.debug:
+            print(f"ParallelConvBlock output shape: {out.shape}")
+            
+        return out
 
 
 class Conv4DPetNet(nn.Module):
-    """4D Convolutional PET Network with kernel-level attention."""
+    """4D Convolutional PET Network with parallel multi-scale branches."""
     
     def __init__(
         self,
         input_channels: int = 6,
         input_time: int = 3,
-        hidden_channels: int = 64,
+        base_channels: int = 32,
         output_features: int = 3,
         debug: bool = False
     ):
@@ -186,19 +185,22 @@ class Conv4DPetNet(nn.Module):
         # Calculate input size for first conv (T * C)
         first_conv_in = input_time * input_channels
         
-        # Attention-based kernel convolution
-        self.attention_conv = AttentionKernelConv(
+        # Single parallel convolution block that processes the input
+        self.parallel_conv = ParallelConvBlock(
             in_channels=first_conv_in,
-            out_channels=hidden_channels,
+            out_channels_per_branch=base_channels,
             debug=debug
         )
+        
+        # Calculate final feature channels after parallel block
+        final_channels = base_channels * 2
         
         # Global average pooling to reduce spatial dimensions
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         
         # Prediction head (3-layer MLP with sparsity)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_channels, 512),
+            nn.Linear(final_channels, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.7),  # 30% sparsity
             
@@ -235,11 +237,11 @@ class Conv4DPetNet(nn.Module):
         if self.debug:
             print(f"After flattening T*C: {x.shape}")
         
-        # Pass through attention-based kernel convolution
-        x = self.attention_conv(x)
+        # Pass through parallel convolution block
+        x = self.parallel_conv(x)
         
         if self.debug:
-            print(f"After attention conv: {x.shape}")
+            print(f"After parallel conv block: {x.shape}")
         
         # Global pooling and flatten
         x = self.global_pool(x)  # (B, features, 1, 1)
@@ -256,24 +258,24 @@ class Conv4DPetNet(nn.Module):
         
         return x
 
-
 # Test with dummy data
 if __name__ == "__main__":
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Input data shape from original code
-    B, C, T, H, W = 2, 6, 3, 62, 519
+    # B, C, T, H, W = 2, 6, 3, 62, 519
+    B, C, T, H, W = 8, 2, 3, 207, 41
     x = torch.rand(B, C, T, H, W, device=device)
     
-    print("=== Conv4D PET Network with Kernel Attention Test ===")
+    print("=== Conv4D PET Network Test ===")
     print(f"Input shape: {x.shape}")
     
     # Create model with debug enabled
     model = Conv4DPetNet(
         input_channels=C,
         input_time=T,
-        hidden_channels=64,
+        base_channels=32,
         output_features=3,
         debug=True
     ).to(device)

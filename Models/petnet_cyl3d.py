@@ -612,7 +612,7 @@ class PetNetCyl3DDepthwise(nn.Module):
     def _compute_flatten_dim(self, in_channels, input_shape):
         """Compute feature map flatten size at init time (TorchScript safe)."""
         C, T, H, W = input_shape
-        dummy = torch.zeros(1, C, T, H, W)
+        dummy = torch.zeros(1, in_channels, T, H, W)
         with torch.no_grad():
             # Forward through backbone manually
             x = self.act1(self.norm1(self.conv1(dummy)))
@@ -900,7 +900,7 @@ class PetNetCyl3DWindowedAttention(nn.Module):
         """Compute feature map flatten size at init time (TorchScript safe)."""
         C, T, H, W = input_shape
         # Create dummy input with original channels
-        dummy = torch.zeros(1, C, T, H, W)
+        dummy = torch.zeros(1, in_channels, T, H, W)
         
         with torch.no_grad():
             # Forward through full model pipeline
@@ -1046,54 +1046,54 @@ class PetNetCyl3DWindowedAttention(nn.Module):
         return feature_maps
 
 
-# -----------------------------------------------------------
-# Test
-# -----------------------------------------------------------
-if __name__ == "__main__":
-    # Test regular model
-    B, C, T, H, W = 4, 2, 3, 207, 41
+# # -----------------------------------------------------------
+# # Test
+# # -----------------------------------------------------------
+# if __name__ == "__main__":
+#     # Test regular model
+#     B, C, T, H, W = 4, 2, 3, 207, 41
 
-    model = PetNetCyl3D(in_channels=C, base_channels=8, num_layers=3)
-    x = torch.randn(B, C, T, H, W)
-    y_pred = model(x)
-    print(f"Regular model output shape: {y_pred.shape}")
+#     model = PetNetCyl3D(in_channels=C, base_channels=8, num_layers=3)
+#     x = torch.randn(B, C, T, H, W)
+#     y_pred = model(x)
+#     print(f"Regular model output shape: {y_pred.shape}")
 
-    compact_model = PetNetCyl3DCompact(in_channels=C)
-    y_pred_compact = compact_model(x)
-    print(f"Compact model output shape: {y_pred_compact.shape}")
+#     compact_model = PetNetCyl3DCompact(in_channels=C)
+#     y_pred_compact = compact_model(x)
+#     print(f"Compact model output shape: {y_pred_compact.shape}")
 
-    full_model = PetNetCyl3DFullFeatures(in_channels=C, base_channels=6, out_features=6)
-    y_pred_full = full_model(x)
-    print(f"Full model output shape: {y_pred_full.shape}")
+#     full_model = PetNetCyl3DFullFeatures(in_channels=C, base_channels=6, out_features=6)
+#     y_pred_full = full_model(x)
+#     print(f"Full model output shape: {y_pred_full.shape}")
 
-    full_attn_model = PetNetCyl3DAttentionFull(in_channels=C, base_channels=6, out_features=6)
-    y_pred_full_attm = full_attn_model(x)
-    print(f"Full attention model output shape: {y_pred_full_attm.shape}")
+#     full_attn_model = PetNetCyl3DAttentionFull(in_channels=C, base_channels=6, out_features=6)
+#     y_pred_full_attm = full_attn_model(x)
+#     print(f"Full attention model output shape: {y_pred_full_attm.shape}")
 
-    # Standard depthwise model
-    depthwise_model = PetNetCyl3DDepthwise(in_channels=C, base_channels=6, out_features=6)
-    y_pred_dw = depthwise_model(x)
-    print(f"Depthwise model output shape: {y_pred_dw.shape}")
+#     # Standard depthwise model
+#     depthwise_model = PetNetCyl3DDepthwise(in_channels=C, base_channels=6, out_features=6)
+#     y_pred_dw = depthwise_model(x)
+#     print(f"Depthwise model output shape: {y_pred_dw.shape}")
 
-    windowed_model = PetNetCyl3DWindowedAttention(in_channels=C, base_channels=6, 
-        out_features=6, window_size=8, attn_heads=2)
-    y_pred_window = depthwise_model(x)
-    print(f"Windowed model output shape: {y_pred_window.shape}")
+#     windowed_model = PetNetCyl3DWindowedAttention(in_channels=C, base_channels=6, 
+#         out_features=6, window_size=8, attn_heads=2)
+#     y_pred_window = depthwise_model(x)
+#     print(f"Windowed model output shape: {y_pred_window.shape}")
 
-    custom_pool = PetNetCyl3DCustomPool(in_channels=C, base_channels=6, out_features=6,
-                                       output_timesteps=T, output_height=H, output_width=W)
-    y_pred_custom = custom_pool(x)
-    print(f"Custom pool model output shape: {y_pred_custom.shape}")
+#     custom_pool = PetNetCyl3DCustomPool(in_channels=C, base_channels=6, out_features=6,
+#                                        output_timesteps=T, output_height=H, output_width=W)
+#     y_pred_custom = custom_pool(x)
+#     print(f"Custom pool model output shape: {y_pred_custom.shape}")
 
-    # Count parameters
-    def count_params(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+#     # Count parameters
+#     def count_params(model):
+#         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"Regular model parameters: {count_params(model):,}")
-    print(f"Compact model parameters: {count_params(compact_model):,}")
-    print(f"Full model parameters: {count_params(full_model):,}")
-    print(f"Full attention model parameters: {count_params(full_attn_model):,}")
-    print(f"DW model parameters: {count_params(depthwise_model):,}")
-    print(f"Windowed model parameters: {count_params(windowed_model):,}")
-    print(f"Custom pool model parameters: {count_params(custom_pool):,}")
+#     print(f"Regular model parameters: {count_params(model):,}")
+#     print(f"Compact model parameters: {count_params(compact_model):,}")
+#     print(f"Full model parameters: {count_params(full_model):,}")
+#     print(f"Full attention model parameters: {count_params(full_attn_model):,}")
+#     print(f"DW model parameters: {count_params(depthwise_model):,}")
+#     print(f"Windowed model parameters: {count_params(windowed_model):,}")
+#     print(f"Custom pool model parameters: {count_params(custom_pool):,}")
 

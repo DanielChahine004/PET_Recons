@@ -66,7 +66,6 @@ class ResidualBlock3D(nn.Module):
 ###############################################################################
 # PetNetImproved3D
 ###############################################################################
-
 class PetNetImproved3D(nn.Module):
     """
     A 3D version of PetNet:
@@ -196,6 +195,8 @@ class PetNetImproved3D(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+
+
 
 if __name__ == "__main__":
 
