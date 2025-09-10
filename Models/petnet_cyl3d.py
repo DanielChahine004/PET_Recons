@@ -82,7 +82,8 @@ class Conv3dCircW(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.pad_w > 0:
             # F.pad pads in reverse order: (Wl, Wr, Hl, Hr, Dl, Dr)
-            x = F.pad(x, (self.pad_w, self.pad_w, 0, 0, 0, 0), mode="circular")
+            # x = F.pad(x, (self.pad_w, self.pad_w, 0, 0, 0, 0), mode="circular")
+            x = F.pad(x, (0, 0, self.pad_w, self.pad_w,  0, 0), mode="circular")
         return self.conv(x)
 
 
@@ -136,7 +137,7 @@ class ResidualBlock3D(nn.Module):
 
 
 # -----------------------------------------------------------
-# Improved PetNetCyl3D with better regularization
+# Improved PetNetCyl3D with better regularization - BEST SO FAR
 # -----------------------------------------------------------
 class PetNetCyl3D(nn.Module):
     def __init__(
